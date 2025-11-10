@@ -52,13 +52,15 @@ INSTALLED_APPS = [
 ALLOWED_HOSTS = [
     '127.0.0.1',
     'localhost',
-    '62.72.22.223'
+    '62.72.22.223',
+    'news-review-demo.vercel.app'
 ]
 
 CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
     "http://localhost:5173",
-    "http://62.72.22.223"
+    "http://62.72.22.223",
+    "https://news-review-demo.vercel.app"
 ]
 
 MIDDLEWARE = [
