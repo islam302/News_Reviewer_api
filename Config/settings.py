@@ -28,7 +28,7 @@ SECRET_KEY = 'django-insecure-ic--fdz+v-bp*sw&*iaxlvqc32&(g$1a&y285uk2s_-&zmyyb6
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
-
+API_BASE_URL = "http://127.0.0.1:8005"
 
 # Application definition
 
