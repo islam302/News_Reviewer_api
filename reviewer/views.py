@@ -102,6 +102,8 @@ class ReviewNewsView(APIView):
                 guideline_chunks=guideline_chunks,
                 example_chunks=example_chunks,
             )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except RuntimeError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
