@@ -295,6 +295,7 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
         "4. Remove all prayer phrases (حفظه الله, رعاه الله, etc.) completely.\n"
         "5. Rewrite the article according to UNA editorial style.\n"
         "6. Return ONLY the final revised news article in Arabic with no additional analysis or commentary."
+        " Ensure the revised article is organized into clear paragraphs separated by a blank line."
     )
 
     return [
@@ -379,7 +380,8 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "5. Apply all editorial style guidelines (remove emotional expressions, ensure objectivity, etc.).\n"
                 "6. Final verification: Read through the entire article one more time to catch ANY missed honorifics or redundant phrases.\n"
                 "7. Rewrite the article according to UNA editorial style.\n"
-                "8. Deliver ONLY the final revised article text in Arabic; no analysis or explanations."
+                "8. Deliver ONLY the final revised article text in Arabic; no analysis or explanations.\n"
+                "9. Present the revised article as clear paragraphs separated by a blank line."
             ),
         },
         {"role": "user", "content": user_prompt},
