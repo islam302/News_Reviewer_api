@@ -1,16 +1,13 @@
 from __future__ import annotations
-
 import re
 from dataclasses import dataclass
 from typing import Iterable, List, Sequence
-
 from django.conf import settings
 from django.db import transaction
-
 from docx import Document
 from openai import OpenAI
-
 from .models import DocumentChunk
+
 
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -154,86 +151,75 @@ def retrieve_similar_chunks(
 
 def _preprocess_honorifics(text: str) -> str:
     """
-    Preprocess text to remove or replace honorific phrases before sending to AI model.
-    This ensures consistent handling of honorifics regardless of what the model does.
-    Handles context-aware replacements (e.g., Crown Prince vs regular Prince).
+    Preprocess text to remove excessive honorifics while keeping official titles.
+
+    KEEP (Official Titles):
+    - خادم الحرمين الشريفين (official title for Saudi King)
+    - صاحب السمو الملكي (official title for Royal Highness)
+
+    REMOVE (Exaggerated Phrases):
+    - جلالة الملك المعظم أيده الله → الملك
+    - فخامة الرئيس حفظه الله → الرئيس
+    - Prayer phrases: حفظه الله، أيده الله، رعاه الله
+    - Exaggerated adjectives: المعظم، الجليل
     """
     processed_text = text
-    
-    # Handle Crown Prince context first (more specific patterns)
-    # Pattern: "صاحب السمو الملكي الأمير [NAME] ولي العهد [POSITION]"
-    # Result: "ولي العهد [POSITION] الأمير [NAME]"
-    processed_text = re.sub(
-        r'صاحب\s+السمو\s+الملكي\s+الأمير\s+([^،.]+?)\s+ولي\s+العهد\s+([^،.]+?)(?=[،.])',
-        r'ولي العهد \2 الأمير \1',
-        processed_text,
-        flags=re.IGNORECASE
-    )
-    # Pattern: "صاحب السمو الملكي [NAME] ولي العهد [POSITION]"
-    processed_text = re.sub(
-        r'صاحب\s+السمو\s+الملكي\s+([^،.]+?)\s+ولي\s+العهد\s+([^،.]+?)(?=[،.])',
-        r'ولي العهد \2 \1',
-        processed_text,
-        flags=re.IGNORECASE
-    )
-    # Pattern: "صاحب السمو الملكي الأمير [NAME] ولي العهد" (without position)
-    processed_text = re.sub(
-        r'صاحب\s+السمو\s+الملكي\s+الأمير\s+([^،.]+?)\s+ولي\s+العهد',
-        r'ولي العهد الأمير \1',
-        processed_text,
-        flags=re.IGNORECASE
-    )
-    
+
     # Define comprehensive replacement patterns (order matters - most specific first)
     replacements = [
-        # King honorifics - must preserve ال التعريف
-        (r'حضرة\s+صاحب\s+الجلالة\s+الملك\s+المعظم', 'الملك'),
+        # King honorifics - REMOVE exaggerated parts, keep simple title
+        # "جلالة الملك المعظم" → "الملك" (remove exaggeration)
         (r'جلالة\s+الملك\s+المعظم', 'الملك'),
+        (r'جلالة\s+الملك', 'الملك'),
+        (r'حضرة\s+صاحب\s+الجلالة\s+الملك\s+المعظم', 'الملك'),
         (r'حضرة\s+صاحب\s+الجلالة\s+الملك', 'الملك'),
         (r'صاحب\s+الجلالة\s+الملك\s+المعظم', 'الملك'),
         (r'صاحب\s+الجلالة\s+الملك', 'الملك'),
-        (r'جلالة\s+الملك', 'الملك'),
         (r'الملك\s+المعظم', 'الملك'),
-        
-        # Sultan honorifics - must preserve ال التعريف
+
+        # Sultan honorifics - REMOVE exaggerated parts
         (r'حضرة\s+صاحب\s+الجلالة\s+السلطان\s+المعظم', 'السلطان'),
         (r'حضرة\s+صاحب\s+الجلالة\s+السلطان', 'السلطان'),
         (r'صاحب\s+الجلالة\s+السلطان\s+المعظم', 'السلطان'),
         (r'صاحب\s+الجلالة\s+السلطان', 'السلطان'),
         (r'جلالة\s+السلطان', 'السلطان'),
         (r'السلطان\s+المعظم', 'السلطان'),
-        
-        # Crown Prince/Prince honorifics - remove redundant combinations
-        (r'صاحب\s+السمو\s+الملكي\s+الأمير', 'الأمير'),  # Remove redundant honorific
-        (r'صاحب\s+السمو\s+الملكي', 'الأمير'),  # Default to الأمير if context unclear
-        (r'صاحب\s+السمو\s+الأمير', 'الأمير'),
-        
-        # Remove redundant "الكريم" from "سموه الكريم"
+
+        # President honorifics - REMOVE "فخامة" but this is less common in Gulf news
+        (r'فخامة\s+الرئيس', 'الرئيس'),
+
+        # Prince titles - KEEP "صاحب السمو الملكي" as it's an official title
+        # But remove exaggerated adjectives like "الجليل" or "الكريم" when standalone
         (r'سموه\s+الكريم', 'سموه'),
-        
-        # Prayer phrases - delete completely (with word boundaries)
+        (r'سموه\s+الجليل', 'سموه'),
+
+        # Prayer phrases - DELETE completely (these are pure exaggeration, not titles)
         (r'\s+حفظه\s+الله\s+', ' '),
+        (r'\s+حفظها\s+الله\s+', ' '),
         (r'\s+رعاه\s+الله\s+', ' '),
+        (r'\s+رعاها\s+الله\s+', ' '),
         (r'\s+نصره\s+الله\s+', ' '),
         (r'\s+أيده\s+الله\s+', ' '),
         (r'\s+أطال\s+الله\s+عمره\s+', ' '),
+        (r'\s+أدام\s+الله\s+عزه\s+', ' '),
         (r'\s+حفظهما\s+الله\s+', ' '),
         (r'\s+حفظهم\s+الله\s+', ' '),
         (r'\s+حفظه\s+الله\s*$', ' '),  # At end of sentence
         (r'^\s*حفظه\s+الله\s+', ' '),  # At start of sentence
-        
-        # Remove redundant words
-        (r'\bخالص\s+', ''),  # Remove "خالص" before "تهانيه"
+
+        # Exaggerated adjectives - DELETE
+        (r'\bخالص\s+', ''),  # "خالص تهانيه" → "تهانيه"
+        (r'\bالجليل\s+', ''),  # When used as standalone adjective
     ]
-    
+
     # Apply all replacements
     for pattern, replacement in replacements:
         processed_text = re.sub(pattern, replacement, processed_text, flags=re.IGNORECASE)
-    
+
     # Clean up multiple spaces and trim
     processed_text = re.sub(r'\s+', ' ', processed_text)
     processed_text = processed_text.strip()
-    
+
     return processed_text
 
 
@@ -252,6 +238,11 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
     example_section = "\n\n".join(example_section_lines) if example_section_lines else "No examples available."
 
     user_prompt = (
+        "⚠️ CRITICAL OUTPUT FORMAT REQUIREMENT ⚠️\n"
+        "Your output MUST be divided into MULTIPLE paragraphs separated by blank lines.\n"
+        "DO NOT write the article as one continuous paragraph.\n"
+        "Each paragraph = ONE main idea.\n"
+        "Separate paragraphs with double newlines (\\n\\n).\n\n"
         "### Editorial Guidelines\n"
         f"{guideline_section}\n\n"
         "### Reference News Examples\n"
@@ -261,41 +252,82 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
         "FIRST: Validate that the text above is a legitimate news article. "
         "If it is random, inappropriate, meaningless, or not a news article, "
         "respond ONLY with: 'ERROR: النص المقدم غير مناسب أو غير صالح للمعالجة. يرجى تقديم خبر صحيح.'\n\n"
-        "CRITICAL REPLACEMENT RULES - APPLY EXACTLY AS SPECIFIED:\n"
-        "MANDATORY TITLE REPLACEMENTS:\n"
-        "1. 'جلالة الملك المعظم' → MUST become 'الملك' (with ال التعريف)\n"
-        "2. 'حضرة صاحب الجلالة الملك' → MUST become 'الملك' (with ال التعريف)\n"
-        "3. 'حضرة صاحب الجلالة السلطان' → MUST become 'السلطان' (with ال التعريف)\n"
-        "4. 'صاحب الجلالة السلطان' → MUST become 'السلطان' (with ال التعريف)\n"
-        "5. 'جلالة السلطان' → MUST become 'السلطان' (with ال التعريف)\n"
-        "6. 'جلالة الملك' → MUST become 'الملك' (with ال التعريف)\n"
-        "7. 'السلطان المعظم' → MUST become 'السلطان' (with ال التعريف)\n"
-        "8. 'الملك المعظم' → MUST become 'الملك' (with ال التعريف)\n\n"
-        "MANDATORY PRINCE/CROWN PRINCE REPLACEMENTS:\n"
-        "9. 'صاحب السمو الملكي الأمير' → MUST become 'الأمير' OR 'ولي العهد' (depending on context, but NEVER both together)\n"
-        "10. 'صاحب السمو الملكي' (when referring to Crown Prince) → MUST become 'ولي العهد' OR 'الأمير'\n"
-        "11. 'صاحب السمو الملكي' (when referring to Prince) → MUST become 'الأمير'\n"
-        "12. 'صاحب السمو الأمير' → MUST become 'الأمير'\n"
-        "13. 'سموه الكريم' → MUST become 'سموه' (remove 'الكريم')\n"
-        "14. 'سموه' (when followed by name) → Can remain 'سموه' OR be replaced with appropriate title\n\n"
-        "MANDATORY PHRASE DELETIONS:\n"
-        "15. 'حفظه الله' / 'رعاه الله' / 'نصره الله' / 'أيده الله' / 'أطال الله عمره' / 'حفظهما الله' → MUST be DELETED completely\n"
-        "16. 'خالص' (in 'خالص تهانيه') → MUST be DELETED (becomes 'تهانيه' only)\n"
-        "17. 'المعظم' (when attached to titles) → MUST be DELETED\n\n"
-        "CRITICAL: You MUST scan for ALL honorific and exaggerated phrases. "
-        "If you see 'صاحب السمو الملكي الأمير', you MUST simplify it to 'الأمير' or 'ولي العهد' (NOT both). "
-        "Never leave redundant honorific phrases. Be extremely thorough and check every detail.\n\n"
-        "IMPORTANT: When replacing titles, you MUST preserve the definite article 'ال' before the title. "
-        "For example, 'السلطان' (with ال) is correct, but 'سلطان' (without ال) is WRONG. "
-        "Similarly, 'الملك' (with ال) is correct, but 'ملك' (without ال) is WRONG.\n\n"
+        "CRITICAL REPLACEMENT RULES - UNDERSTAND THE DISTINCTION:\n\n"
+        "⚠️ IMPORTANT DISTINCTION BETWEEN OFFICIAL TITLES AND EXAGGERATION ⚠️\n\n"
+        "WHAT TO KEEP (Official State Titles - DO NOT REMOVE):\n"
+        "These are OFFICIAL titles recognized by the state and must be preserved:\n"
+        "✅ 'خادم الحرمين الشريفين' - Official title of Saudi King → KEEP AS-IS\n"
+        "✅ 'صاحب السمو الملكي' - Official title (His Royal Highness) → KEEP AS-IS\n"
+        "✅ 'ولي العهد' - Official position → KEEP AS-IS\n"
+        "✅ 'رئيس مجلس الوزراء' - Official position → KEEP AS-IS\n\n"
+        "WHAT TO REMOVE (Exaggerated Phrases - NOT Official Titles):\n"
+        "These are exaggerations and must be simplified or removed:\n"
+        "❌ 'جلالة الملك المعظم' → ✅ 'الملك' (remove exaggeration, keep simple title)\n"
+        "❌ 'جلالة الملك' → ✅ 'الملك'\n"
+        "❌ 'حضرة صاحب الجلالة الملك' → ✅ 'الملك'\n"
+        "❌ 'صاحب الجلالة الملك' → ✅ 'الملك'\n"
+        "❌ 'حضرة صاحب الجلالة السلطان المعظم' → ✅ 'السلطان'\n"
+        "❌ 'صاحب الجلالة السلطان' → ✅ 'السلطان'\n"
+        "❌ 'جلالة السلطان' → ✅ 'السلطان'\n"
+        "❌ 'السلطان المعظم' → ✅ 'السلطان'\n"
+        "❌ 'فخامة الرئيس' → ✅ 'الرئيس'\n"
+        "❌ Prayer phrases: 'حفظه الله', 'أيده الله', 'رعاه الله', 'نصره الله', 'أطال الله عمره' → DELETE COMPLETELY\n"
+        "❌ 'خالص تهانيه' → ✅ 'تهانيه' (remove 'خالص')\n"
+        "❌ 'سموه الكريم' → ✅ 'سموه' (remove 'الكريم' when redundant)\n"
+        "❌ 'المعظم' (when used as exaggeration) → DELETE\n"
+        "❌ 'الجليل' (when used as exaggeration) → DELETE\n\n"
+        "CORRECT EXAMPLES:\n"
+        "Example 1 - Exaggeration removed, official title kept:\n"
+        "Before: 'بعث جلالة الملك المعظم حمد بن عيسى آل خليفة حفظه الله برقية تهنئة خالصة'\n"
+        "After: 'بعث الملك حمد بن عيسى آل خليفة برقية تهنئة'\n"
+        "(Removed: جلالة, المعظم, حفظه الله, خالصة)\n\n"
+        "Example 2 - Official title preserved:\n"
+        "Before: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء حفظه الله'\n"
+        "After: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء'\n"
+        "(Kept: صاحب السمو الملكي - it's official!, Removed: حفظه الله)\n\n"
+        "Example 3 - Official Saudi title preserved:\n"
+        "Before: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود حفظه الله أيده الله'\n"
+        "After: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود'\n"
+        "(Kept: خادم الحرمين الشريفين - official title!, Removed: حفظه الله, أيده الله)\n\n"
+        "IMPORTANT: When replacing exaggerated titles, preserve 'ال' (definite article):\n"
+        "✅ CORRECT: 'السلطان' (with ال), 'الملك' (with ال)\n"
+        "❌ WRONG: 'سلطان' (without ال), 'ملك' (without ال)\n\n"
         "STEP-BY-STEP PROCESS:\n"
         "1. Scan the entire article for ALL prohibited phrases listed in the guidelines.\n"
         "2. Replace each prohibited phrase with its EXACT specified replacement, preserving ال التعريف when required.\n"
         "3. Double-check that titles like 'السلطان' and 'الملك' always include ال التعريف.\n"
         "4. Remove all prayer phrases (حفظه الله, رعاه الله, etc.) completely.\n"
         "5. Rewrite the article according to UNA editorial style.\n"
-        "6. Return ONLY the final revised news article in Arabic with no additional analysis or commentary."
-        " Ensure the revised article is organized into clear paragraphs separated by a blank line."
+        "6. CRITICAL REQUIREMENT - PARAGRAPH DIVISION (MANDATORY):\n"
+        "   YOU MUST divide the article into MULTIPLE separate paragraphs. This is NOT optional.\n"
+        "   - NEVER return the article as one continuous block of text.\n"
+        "   - Each paragraph MUST be separated by TWO newlines (a blank line between paragraphs).\n"
+        "   - Each paragraph should focus on ONE main idea, event, or statement.\n"
+        "   - Minimum 3-5 paragraphs for most news articles (adjust based on content length).\n"
+        "\n"
+        "   PARAGRAPH STRUCTURE GUIDELINES:\n"
+        "   Paragraph 1: Opening - Main news announcement with key facts (who, what, when, where)\n"
+        "   Paragraph 2: Context/Details - Background information or event details\n"
+        "   Paragraph 3: Statements/Quotes - What officials said or actions taken\n"
+        "   Paragraph 4: Additional Information - Secondary details, attendees, or related information\n"
+        "   Paragraph 5: Conclusion - Closing remarks, future implications, or wrap-up\n"
+        "\n"
+        "   EXAMPLE FORMAT (note the blank lines between paragraphs):\n"
+        "   المنامة في 10 نوفمبر / بنا / أكد ولي العهد رئيس مجلس الوزراء الأمير سلمان بن حمد آل خليفة...\n"
+        "\n"
+        "   جاء ذلك لدى لقاء سموه اليوم في قصر القضيبية...\n"
+        "\n"
+        "   وأشاد سموه بما تشهده سلطنة عُمان الشقيقة من نهضةٍ تنمويةٍ متواصلة...\n"
+        "\n"
+        "   كما جرى خلال اللقاء استعراض القضايا ذات الاهتمام المشترك...\n"
+        "\n"
+        "   من جانبه، أعرب وزير الداخلية بسلطنة عُمان الشقيقة عن شكره...\n"
+        "\n"
+        "7. Return ONLY the final revised news article in Arabic with PROPERLY SEPARATED PARAGRAPHS. No analysis or commentary.\n\n"
+        "⚠️⚠️⚠️ FINAL REMINDER - READ THIS BEFORE OUTPUTTING ⚠️⚠️⚠️\n"
+        "Your response must contain AT LEAST 3-5 separate paragraphs with blank lines between them.\n"
+        "If you return the article as ONE paragraph, you have FAILED the task.\n"
+        "Format: Paragraph1\\n\\nParagraph2\\n\\nParagraph3\\n\\nParagraph4\\n\\nParagraph5\n"
     )
 
     return [
@@ -315,40 +347,37 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "   - Clearly not related to news or journalism\n"
                 "2. If you reject the text, respond ONLY with: 'ERROR: النص المقدم غير مناسب أو غير صالح للمعالجة. يرجى تقديم خبر صحيح.'\n"
                 "3. Only proceed with editing if the text is a legitimate, coherent news article.\n\n"
-                "CRITICAL REPLACEMENT ACCURACY REQUIREMENTS:\n"
-                "1. You MUST apply ALL replacement rules with EXACT precision as specified in the guidelines.\n"
-                "2. When replacing titles, you MUST preserve the Arabic definite article 'ال' (al-) before the title.\n"
-                "   - CORRECT: 'السلطان هيثم بن طارق' (السلطان with ال)\n"
-                "   - WRONG: 'سلطان هيثم بن طارق' (سلطان without ال)\n"
-                "   - CORRECT: 'الملك حمد بن عيسى' (الملك with ال)\n"
-                "   - WRONG: 'ملك حمد بن عيسى' (ملك without ال)\n"
-                "3. Common replacements:\n"
-                "   - 'حضرة صاحب الجلالة السلطان' → 'السلطان' (NOT 'سلطان')\n"
-                "   - 'صاحب الجلالة السلطان' → 'السلطان' (NOT 'سلطان')\n"
-                "   - 'جلالة الملك المعظم' → 'الملك' (NOT 'ملك')\n"
-                "   - 'حضرة صاحب الجلالة الملك' → 'الملك' (NOT 'ملك')\n"
-                "   - 'صاحب السمو الملكي الأمير' → 'الأمير' OR 'ولي العهد' (NEVER both together - this is redundant)\n"
-                "   - 'صاحب السمو الملكي' (Crown Prince) → 'ولي العهد' OR 'الأمير'\n"
-                "   - 'صاحب السمو الملكي' (Prince) → 'الأمير'\n"
-                "   - 'سموه الكريم' → 'سموه' (remove 'الكريم')\n"
-                "4. Prayer phrases like 'حفظه الله', 'رعاه الله', 'نصره الله' MUST be completely DELETED.\n"
-                "5. Redundant honorific words like 'خالص', 'المعظم' MUST be DELETED.\n"
-                "6. These rules are MANDATORY - zero tolerance for errors. Check EVERY detail.\n\n"
-                "GENERAL RULE FOR TITLE REPLACEMENT:\n"
-                "When discovering any honorific phrase or prayer associated with a title, it must be deleted "
-                "or replaced with the official permitted title, without affecting the meaning of the sentence.\n\n"
-                "Examples:\n"
-                "Example 1 - King title:\n"
-                "Original: 'بعث جلالة الملك المعظم عبد الله الثاني ابن الحسين برقية تهنئة إلى الرئيس الفرنسي، "
-                "أعرب فيها عن خالص تهانيه وتمنياته له بدوام الصحة والعافية.'\n"
-                "After processing: 'بعث الملك عبد الله الثاني ابن الحسين برقية تهنئة إلى الرئيس الفرنسي، "
-                "أعرب فيها عن تهانيه وتمنياته له بدوام الصحة والعافية.'\n\n"
-                "Example 2 - Crown Prince title (CRITICAL):\n"
-                "Original: 'أكد صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء...'\n"
-                "After processing: 'أكد ولي العهد رئيس مجلس الوزراء الأمير سلمان بن حمد آل خليفة...' "
-                "OR 'أكد الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء...'\n"
-                "WRONG: 'أكد صاحب السمو الملكي الأمير...' (redundant honorifics not removed)\n"
-                "WRONG: 'أكد صاحب السمو الملكي...' (still contains honorific)\n\n"
+                "⚠️ CRITICAL DISTINCTION: OFFICIAL TITLES vs EXAGGERATION ⚠️\n\n"
+                "PRESERVE OFFICIAL STATE TITLES (DO NOT REMOVE):\n"
+                "✅ 'خادم الحرمين الشريفين' - Official Saudi King title → KEEP\n"
+                "✅ 'صاحب السمو الملكي' - Official Royal Highness title → KEEP\n"
+                "✅ 'ولي العهد' - Official Crown Prince position → KEEP\n"
+                "✅ 'رئيس مجلس الوزراء' - Official Prime Minister position → KEEP\n\n"
+                "REMOVE EXAGGERATED PHRASES (NOT Official Titles):\n"
+                "❌ 'جلالة الملك المعظم' → ✅ 'الملك' (exaggeration, simplify)\n"
+                "❌ 'جلالة الملك' → ✅ 'الملك'\n"
+                "❌ 'حضرة صاحب الجلالة الملك' → ✅ 'الملك'\n"
+                "❌ 'صاحب الجلالة السلطان' → ✅ 'السلطان'\n"
+                "❌ 'فخامة الرئيس' → ✅ 'الرئيس'\n"
+                "❌ Prayer phrases: 'حفظه الله', 'أيده الله', 'رعاه الله' → DELETE COMPLETELY\n"
+                "❌ Exaggerated words: 'المعظم', 'الجليل', 'خالص' → DELETE\n"
+                "❌ 'سموه الكريم' → ✅ 'سموه' (remove redundant 'الكريم')\n\n"
+                "CORRECT PROCESSING EXAMPLES:\n"
+                "Example 1 - Removing exaggeration while preserving simple title:\n"
+                "Original: 'بعث جلالة الملك المعظم عبد الله الثاني ابن الحسين حفظه الله برقية تهنئة خالصة'\n"
+                "After: 'بعث الملك عبد الله الثاني ابن الحسين برقية تهنئة'\n"
+                "(Removed: جلالة, المعظم, حفظه الله, خالصة)\n\n"
+                "Example 2 - Preserving official title:\n"
+                "Original: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء حفظه الله'\n"
+                "After: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء'\n"
+                "(Kept: صاحب السمو الملكي because it's an official title! Removed: حفظه الله)\n\n"
+                "Example 3 - Preserving Saudi official title:\n"
+                "Original: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود حفظه الله أيده الله'\n"
+                "After: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود'\n"
+                "(Kept: خادم الحرمين الشريفين - official title! Removed: حفظه الله, أيده الله)\n\n"
+                "IMPORTANT RULE: Always preserve 'ال' (definite article) when simplifying titles:\n"
+                "✅ CORRECT: 'السلطان' (with ال), 'الملك' (with ال)\n"
+                "❌ WRONG: 'سلطان' (without ال), 'ملك' (without ال)\n\n"
                 "EDITORIAL STYLE GUIDELINES:\n"
                 "1. Use only modern formal Arabic language.\n"
                 "2. Avoid emotional and exaggerated expressions.\n"
@@ -361,27 +390,56 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "3. Preserve the original information accurately without modifying facts.\n"
                 "4. Correct linguistic, grammatical, and spelling errors.\n"
                 "5. Adjust punctuation accurately according to linguistic rules to make the news appear professional.\n\n"
-                "DETAILED PROCESS - CHECK EVERY SINGLE DETAIL:\n"
-                "1. Read the guidelines section carefully to identify ALL prohibited phrases.\n"
-                "2. Scan the article systematically for EVERY occurrence of prohibited phrases, including:\n"
-                "   - All honorific titles (جلالة, حضرة صاحب الجلالة, صاحب السمو الملكي, etc.)\n"
-                "   - Redundant combinations like 'صاحب السمو الملكي الأمير' (must simplify)\n"
-                "   - Prayer phrases (حفظه الله, رعاه الله, etc.)\n"
-                "   - Exaggerated words (خالص, المعظم, الكريم when redundant)\n"
-                "3. Replace each occurrence with its EXACT specified replacement:\n"
-                "   - Ensure ال التعريف is preserved for titles (السلطان, الملك, الأمير)\n"
-                "   - Simplify redundant honorifics (e.g., 'صاحب السمو الملكي الأمير' → 'الأمير')\n"
+                "DETAILED EDITING PROCESS:\n"
+                "1. Identify what to KEEP (official titles):\n"
+                "   ✅ خادم الحرمين الشريفين (keep)\n"
+                "   ✅ صاحب السمو الملكي (keep - it's official!)\n"
+                "   ✅ ولي العهد (keep)\n"
+                "   ✅ رئيس مجلس الوزراء (keep)\n\n"
+                "2. Identify what to REMOVE/SIMPLIFY (exaggeration):\n"
+                "   ❌ جلالة الملك → الملك\n"
+                "   ❌ صاحب الجلالة السلطان → السلطان\n"
+                "   ❌ حفظه الله, أيده الله, رعاه الله → DELETE\n"
+                "   ❌ المعظم, الجليل, خالص → DELETE\n\n"
+                "3. Apply replacements carefully:\n"
+                "   - Keep official titles: خادم الحرمين الشريفين, صاحب السمو الملكي\n"
+                "   - Simplify exaggerations: جلالة الملك → الملك\n"
                 "   - Remove prayer phrases completely\n"
-                "   - Remove redundant words like 'خالص', 'المعظم'\n"
-                "4. Double-check EVERY title:\n"
-                "   - All titles must have ال التعريف (السلطان, الملك, الأمير)\n"
-                "   - No redundant honorific combinations\n"
-                "   - No prayer phrases remaining\n"
-                "5. Apply all editorial style guidelines (remove emotional expressions, ensure objectivity, etc.).\n"
-                "6. Final verification: Read through the entire article one more time to catch ANY missed honorifics or redundant phrases.\n"
+                "   - Preserve ال التعريف when simplifying (السلطان not سلطان)\n\n"
+                "4. Double-check:\n"
+                "   - Official titles still present? ✅\n"
+                "   - Prayer phrases deleted? ✅\n"
+                "   - Exaggerated words removed? ✅\n"
+                "   - ال التعريف preserved in simplified titles? ✅\n\n"
+                "5. Apply editorial style guidelines (objectivity, clarity, etc.).\n"
+                "6. Final verification: Ensure the balance between keeping official titles and removing exaggeration.\n"
                 "7. Rewrite the article according to UNA editorial style.\n"
-                "8. Deliver ONLY the final revised article text in Arabic; no analysis or explanations.\n"
-                "9. Present the revised article as clear paragraphs separated by a blank line."
+                "8. MANDATORY PARAGRAPH DIVISION - THIS IS CRITICAL AND NON-NEGOTIABLE:\n"
+                "   IMPORTANT: You MUST divide the article into multiple separate paragraphs.\n"
+                "   DO NOT write the article as a single continuous paragraph.\n"
+                "\n"
+                "   a) Analyze the article content to identify distinct topics, ideas, or events.\n"
+                "   b) Create separate paragraphs for each distinct idea:\n"
+                "      - Paragraph 1: Main announcement/opening (who did what, when, where)\n"
+                "      - Paragraph 2: Event context and details (background, setting, attendees)\n"
+                "      - Paragraph 3: Main statements or actions (what was said or done)\n"
+                "      - Paragraph 4: Additional information (related details, secondary statements)\n"
+                "      - Paragraph 5: Conclusion (wrap-up, future implications, or closing remarks)\n"
+                "   c) Each paragraph should be 2-4 sentences maximum.\n"
+                "   d) CRITICAL: Separate each paragraph with TWO newline characters (\\n\\n) to create a blank line.\n"
+                "   e) Ensure logical flow and smooth transitions between paragraphs.\n"
+                "   f) The article MUST have at least 3-5 paragraphs unless the content is extremely short.\n"
+                "\n"
+                "   EXAMPLE OF CORRECT OUTPUT FORMAT:\n"
+                "   المنامة في 10 نوفمبر / بنا / أكد ولي العهد...\n"
+                "   [BLANK LINE]\n"
+                "   جاء ذلك لدى لقاء سموه اليوم...\n"
+                "   [BLANK LINE]\n"
+                "   وأشاد سموه بما تشهده سلطنة عُمان...\n"
+                "   [BLANK LINE]\n"
+                "   كما جرى خلال اللقاء استعراض...\n"
+                "\n"
+                "9. Deliver ONLY the final revised article text in Arabic with PROPERLY DIVIDED PARAGRAPHS; no analysis or explanations."
             ),
         },
         {"role": "user", "content": user_prompt},
