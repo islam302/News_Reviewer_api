@@ -252,43 +252,69 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
         "FIRST: Validate that the text above is a legitimate news article. "
         "If it is random, inappropriate, meaningless, or not a news article, "
         "respond ONLY with: 'ERROR: النص المقدم غير مناسب أو غير صالح للمعالجة. يرجى تقديم خبر صحيح.'\n\n"
-        "CRITICAL REPLACEMENT RULES - UNDERSTAND THE DISTINCTION:\n\n"
-        "⚠️ IMPORTANT DISTINCTION BETWEEN OFFICIAL TITLES AND EXAGGERATION ⚠️\n\n"
-        "WHAT TO KEEP (Official State Titles - DO NOT REMOVE):\n"
-        "These are OFFICIAL titles recognized by the state and must be preserved:\n"
-        "✅ 'خادم الحرمين الشريفين' - Official title of Saudi King → KEEP AS-IS\n"
-        "✅ 'صاحب السمو الملكي' - Official title (His Royal Highness) → KEEP AS-IS\n"
-        "✅ 'ولي العهد' - Official position → KEEP AS-IS\n"
-        "✅ 'رئيس مجلس الوزراء' - Official position → KEEP AS-IS\n\n"
-        "WHAT TO REMOVE (Exaggerated Phrases - NOT Official Titles):\n"
-        "These are exaggerations and must be simplified or removed:\n"
-        "❌ 'جلالة الملك المعظم' → ✅ 'الملك' (remove exaggeration, keep simple title)\n"
-        "❌ 'جلالة الملك' → ✅ 'الملك'\n"
-        "❌ 'حضرة صاحب الجلالة الملك' → ✅ 'الملك'\n"
-        "❌ 'صاحب الجلالة الملك' → ✅ 'الملك'\n"
-        "❌ 'حضرة صاحب الجلالة السلطان المعظم' → ✅ 'السلطان'\n"
-        "❌ 'صاحب الجلالة السلطان' → ✅ 'السلطان'\n"
-        "❌ 'جلالة السلطان' → ✅ 'السلطان'\n"
-        "❌ 'السلطان المعظم' → ✅ 'السلطان'\n"
-        "❌ 'فخامة الرئيس' → ✅ 'الرئيس'\n"
-        "❌ Prayer phrases: 'حفظه الله', 'أيده الله', 'رعاه الله', 'نصره الله', 'أطال الله عمره' → DELETE COMPLETELY\n"
-        "❌ 'خالص تهانيه' → ✅ 'تهانيه' (remove 'خالص')\n"
-        "❌ 'سموه الكريم' → ✅ 'سموه' (remove 'الكريم' when redundant)\n"
-        "❌ 'المعظم' (when used as exaggeration) → DELETE\n"
-        "❌ 'الجليل' (when used as exaggeration) → DELETE\n\n"
-        "CORRECT EXAMPLES:\n"
-        "Example 1 - Exaggeration removed, official title kept:\n"
-        "Before: 'بعث جلالة الملك المعظم حمد بن عيسى آل خليفة حفظه الله برقية تهنئة خالصة'\n"
-        "After: 'بعث الملك حمد بن عيسى آل خليفة برقية تهنئة'\n"
-        "(Removed: جلالة, المعظم, حفظه الله, خالصة)\n\n"
-        "Example 2 - Official title preserved:\n"
-        "Before: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء حفظه الله'\n"
-        "After: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء'\n"
-        "(Kept: صاحب السمو الملكي - it's official!, Removed: حفظه الله)\n\n"
-        "Example 3 - Official Saudi title preserved:\n"
-        "Before: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود حفظه الله أيده الله'\n"
-        "After: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود'\n"
-        "(Kept: خادم الحرمين الشريفين - official title!, Removed: حفظه الله, أيده الله)\n\n"
+        "⚠️⚠️⚠️ CRITICAL RULE: UNDERSTAND THE DIFFERENCE BETWEEN OFFICIAL TITLES AND EXAGGERATION ⚠️⚠️⚠️\n\n"
+        "🔴 ABSOLUTE RULE - READ THIS CAREFULLY:\n"
+        "There is a HUGE difference between:\n"
+        "1. OFFICIAL STATE TITLES (الألقاب الرسمية للدولة) = These are REAL titles, NOT exaggeration → MUST KEEP\n"
+        "2. EXAGGERATED PHRASES (التفخيم والتعظيم) = These are praise phrases, NOT titles → MUST REMOVE\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ WHAT TO KEEP - THESE ARE OFFICIAL TITLES (DO NOT TOUCH!):\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1. ✅ 'خادم الحرمين الشريفين' - Official title of Saudi King (like a last name)\n"
+        "   Why? This is his OFFICIAL STATE TITLE, not exaggeration!\n"
+        "   ⚠️ NEVER remove this! It's like removing someone's official job title!\n\n"
+        "2. ✅ 'صاحب السمو الملكي' - Official Royal Highness title (government-recognized)\n"
+        "   Why? This is the OFFICIAL PROTOCOL title for princes, grandson of the King!\n"
+        "   ⚠️ NEVER remove this! It's their official designation in the state!\n\n"
+        "3. ✅ 'ولي العهد' - Official Crown Prince position\n"
+        "4. ✅ 'رئيس مجلس الوزراء' - Official Prime Minister position\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "❌ WHAT TO REMOVE - THESE ARE EXAGGERATION (DELETE OR SIMPLIFY!):\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "1. ❌ 'جلالة الملك المعظم أيده الله' → ✅ 'الملك'\n"
+        "   Why? 'جلالة' and 'المعظم' and 'أيده الله' are EXAGGERATION, not official titles!\n\n"
+        "2. ❌ 'جلالة الملك' → ✅ 'الملك'\n"
+        "3. ❌ 'حضرة صاحب الجلالة الملك' → ✅ 'الملك'\n"
+        "4. ❌ 'صاحب الجلالة السلطان' → ✅ 'السلطان'\n"
+        "5. ❌ 'فخامة الرئيس' → ✅ 'الرئيس'\n"
+        "6. ❌ Prayer phrases: 'حفظه الله', 'أيده الله', 'رعاه الله', 'نصره الله' → DELETE COMPLETELY\n"
+        "7. ❌ Exaggeration words: 'المعظم', 'الجليل', 'خالص' → DELETE\n"
+        "8. ❌ 'سموه الكريم' → ✅ 'سموه'\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📌 KEY DISTINCTION (READ THIS 10 TIMES!):\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "• 'خادم الحرمين الشريفين' = Official title (like saying 'Dr.' or 'President') → KEEP!\n"
+        "• 'صاحب السمو الملكي' = Official royal protocol title → KEEP!\n"
+        "• 'جلالة الملك المعظم' = Exaggerated praise → REMOVE, simplify to 'الملك'\n"
+        "• 'حفظه الله' 'أيده الله' = Prayer/supplication → DELETE COMPLETELY\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📚 MANDATORY EXAMPLES - STUDY THESE CAREFULLY:\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Example 1 - Removing exaggeration, keeping simple title:\n"
+        "❌ BEFORE: 'بعث جلالة الملك المعظم حمد بن عيسى آل خليفة حفظه الله برقية تهنئة خالصة'\n"
+        "✅ AFTER:  'بعث الملك حمد بن عيسى آل خليفة برقية تهنئة'\n"
+        "What we removed: جلالة (exaggeration), المعظم (exaggeration), حفظه الله (prayer), خالصة (exaggeration)\n"
+        "What we kept: الملك (simple title)\n\n"
+        "Example 2 - KEEPING official 'صاحب السمو الملكي' because it's OFFICIAL:\n"
+        "❌ BEFORE: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء حفظه الله'\n"
+        "✅ AFTER:  'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء'\n"
+        "What we removed: حفظه الله (prayer phrase only!)\n"
+        "What we kept: صاحب السمو الملكي (OFFICIAL TITLE - DO NOT TOUCH!), الأمير, ولي العهد, رئيس مجلس الوزراء\n"
+        "⚠️ CRITICAL: We did NOT remove 'صاحب السمو الملكي' because it is an OFFICIAL STATE TITLE!\n\n"
+        "Example 3 - KEEPING official 'خادم الحرمين الشريفين' because it's OFFICIAL:\n"
+        "❌ BEFORE: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود حفظه الله أيده الله'\n"
+        "✅ AFTER:  'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود'\n"
+        "What we removed: حفظه الله (prayer), أيده الله (prayer)\n"
+        "What we kept: خادم الحرمين الشريفين (OFFICIAL SAUDI KING TITLE - NEVER REMOVE!), الملك\n"
+        "⚠️ CRITICAL: We did NOT remove 'خادم الحرمين الشريفين' because it is the OFFICIAL TITLE of Saudi King!\n\n"
+        "Example 4 - What happens when we see 'جلالة' vs 'صاحب السمو الملكي':\n"
+        "❌ WRONG:  'جلالة الملك' → 'جلالة الملك' (keeping exaggeration)\n"
+        "✅ RIGHT:  'جلالة الملك' → 'الملك' (removed exaggeration)\n"
+        "❌ WRONG:  'صاحب السمو الملكي الأمير' → 'الأمير' (removed official title!)\n"
+        "✅ RIGHT:  'صاحب السمو الملكي الأمير' → 'صاحب السمو الملكي الأمير' (kept official title!)\n\n"
+        "🔴 FINAL WARNING:\n"
+        "If you remove 'خادم الحرمين الشريفين' or 'صاحب السمو الملكي', you have FAILED!\n"
+        "These are OFFICIAL STATE TITLES, not exaggeration!\n\n"
         "IMPORTANT: When replacing exaggerated titles, preserve 'ال' (definite article):\n"
         "✅ CORRECT: 'السلطان' (with ال), 'الملك' (with ال)\n"
         "❌ WRONG: 'سلطان' (without ال), 'ملك' (without ال)\n\n"
@@ -347,34 +373,62 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "   - Clearly not related to news or journalism\n"
                 "2. If you reject the text, respond ONLY with: 'ERROR: النص المقدم غير مناسب أو غير صالح للمعالجة. يرجى تقديم خبر صحيح.'\n"
                 "3. Only proceed with editing if the text is a legitimate, coherent news article.\n\n"
-                "⚠️ CRITICAL DISTINCTION: OFFICIAL TITLES vs EXAGGERATION ⚠️\n\n"
-                "PRESERVE OFFICIAL STATE TITLES (DO NOT REMOVE):\n"
-                "✅ 'خادم الحرمين الشريفين' - Official Saudi King title → KEEP\n"
-                "✅ 'صاحب السمو الملكي' - Official Royal Highness title → KEEP\n"
-                "✅ 'ولي العهد' - Official Crown Prince position → KEEP\n"
-                "✅ 'رئيس مجلس الوزراء' - Official Prime Minister position → KEEP\n\n"
-                "REMOVE EXAGGERATED PHRASES (NOT Official Titles):\n"
-                "❌ 'جلالة الملك المعظم' → ✅ 'الملك' (exaggeration, simplify)\n"
-                "❌ 'جلالة الملك' → ✅ 'الملك'\n"
-                "❌ 'حضرة صاحب الجلالة الملك' → ✅ 'الملك'\n"
-                "❌ 'صاحب الجلالة السلطان' → ✅ 'السلطان'\n"
-                "❌ 'فخامة الرئيس' → ✅ 'الرئيس'\n"
-                "❌ Prayer phrases: 'حفظه الله', 'أيده الله', 'رعاه الله' → DELETE COMPLETELY\n"
-                "❌ Exaggerated words: 'المعظم', 'الجليل', 'خالص' → DELETE\n"
-                "❌ 'سموه الكريم' → ✅ 'سموه' (remove redundant 'الكريم')\n\n"
-                "CORRECT PROCESSING EXAMPLES:\n"
-                "Example 1 - Removing exaggeration while preserving simple title:\n"
+                "⚠️⚠️⚠️ CRITICAL DISTINCTION: OFFICIAL STATE TITLES vs EXAGGERATION ⚠️⚠️⚠️\n\n"
+                "🔴 ABSOLUTE RULE YOU MUST UNDERSTAND:\n"
+                "Some phrases are OFFICIAL STATE TITLES (like job titles) - these are NOT exaggeration!\n"
+                "Other phrases are EXAGGERATED PRAISE - these must be removed!\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ PRESERVE THESE - OFFICIAL STATE TITLES (NEVER REMOVE!):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "1. ✅ 'خادم الحرمين الشريفين' - OFFICIAL title of Saudi King\n"
+                "   This is NOT exaggeration! It's like saying 'President' or 'Prime Minister'!\n"
+                "   ⚠️ NEVER EVER remove this phrase! It's his official state designation!\n\n"
+                "2. ✅ 'صاحب السمو الملكي' - OFFICIAL Royal Highness title\n"
+                "   This is NOT exaggeration! It's the government-recognized protocol title!\n"
+                "   ⚠️ NEVER EVER remove this phrase! It's their official rank in the state!\n\n"
+                "3. ✅ 'ولي العهد' - Crown Prince (official position)\n"
+                "4. ✅ 'رئيس مجلس الوزراء' - Prime Minister (official position)\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "❌ REMOVE THESE - EXAGGERATED PRAISE (NOT OFFICIAL!):\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "1. ❌ 'جلالة الملك المعظم' → ✅ 'الملك' (this IS exaggeration!)\n"
+                "2. ❌ 'جلالة الملك' → ✅ 'الملك'\n"
+                "3. ❌ 'حضرة صاحب الجلالة الملك' → ✅ 'الملك'\n"
+                "4. ❌ 'صاحب الجلالة السلطان' → ✅ 'السلطان'\n"
+                "5. ❌ 'فخامة الرئيس' → ✅ 'الرئيس'\n"
+                "6. ❌ Prayer phrases: 'حفظه الله', 'أيده الله', 'رعاه الله' → DELETE\n"
+                "7. ❌ Exaggeration words: 'المعظم', 'الجليل', 'خالص' → DELETE\n\n"
+                "🔑 KEY DIFFERENCE:\n"
+                "• 'خادم الحرمين الشريفين' = Like saying 'President Obama' → KEEP!\n"
+                "• 'صاحب السمو الملكي' = Like saying 'His Royal Highness' → KEEP!\n"
+                "• 'جلالة الملك المعظم' = Like saying 'His Glorious Majesty' → REMOVE!\n"
+                "• 'حفظه الله' = Prayer/blessing → REMOVE!\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📚 MANDATORY EXAMPLES - FOLLOW THESE EXACTLY:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Example 1 - Remove exaggeration, keep simple title:\n"
                 "Original: 'بعث جلالة الملك المعظم عبد الله الثاني ابن الحسين حفظه الله برقية تهنئة خالصة'\n"
                 "After: 'بعث الملك عبد الله الثاني ابن الحسين برقية تهنئة'\n"
-                "(Removed: جلالة, المعظم, حفظه الله, خالصة)\n\n"
-                "Example 2 - Preserving official title:\n"
+                "Removed: جلالة, المعظم, حفظه الله, خالصة\n"
+                "Kept: الملك\n\n"
+                "Example 2 - KEEP 'صاحب السمو الملكي' (OFFICIAL TITLE!):\n"
                 "Original: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء حفظه الله'\n"
                 "After: 'استقبل صاحب السمو الملكي الأمير سلمان بن حمد آل خليفة ولي العهد رئيس مجلس الوزراء'\n"
-                "(Kept: صاحب السمو الملكي because it's an official title! Removed: حفظه الله)\n\n"
-                "Example 3 - Preserving Saudi official title:\n"
+                "Removed: حفظه الله ONLY!\n"
+                "Kept: صاحب السمو الملكي (OFFICIAL!), الأمير, ولي العهد, رئيس مجلس الوزراء\n"
+                "⚠️ Notice: We did NOT remove 'صاحب السمو الملكي' - it's an OFFICIAL title!\n\n"
+                "Example 3 - KEEP 'خادم الحرمين الشريفين' (OFFICIAL TITLE!):\n"
                 "Original: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود حفظه الله أيده الله'\n"
                 "After: 'خادم الحرمين الشريفين الملك سلمان بن عبدالعزيز آل سعود'\n"
-                "(Kept: خادم الحرمين الشريفين - official title! Removed: حفظه الله, أيده الله)\n\n"
+                "Removed: حفظه الله, أيده الله ONLY!\n"
+                "Kept: خادم الحرمين الشريفين (OFFICIAL SAUDI TITLE!), الملك\n"
+                "⚠️ Notice: We did NOT remove 'خادم الحرمين الشريفين' - it's the OFFICIAL title!\n\n"
+                "Example 4 - Understanding the difference:\n"
+                "❌ WRONG: 'صاحب السمو الملكي الأمير' → 'الأمير' (you removed official title!)\n"
+                "✅ RIGHT: 'صاحب السمو الملكي الأمير' → 'صاحب السمو الملكي الأمير' (kept it!)\n"
+                "❌ WRONG: 'جلالة الملك' → 'جلالة الملك' (you kept exaggeration!)\n"
+                "✅ RIGHT: 'جلالة الملك' → 'الملك' (removed exaggeration!)\n\n"
+                "🔴 If you remove 'خادم الحرمين الشريفين' or 'صاحب السمو الملكي', YOU FAILED!\n\n"
                 "IMPORTANT RULE: Always preserve 'ال' (definite article) when simplifying titles:\n"
                 "✅ CORRECT: 'السلطان' (with ال), 'الملك' (with ال)\n"
                 "❌ WRONG: 'سلطان' (without ال), 'ملك' (without ال)\n\n"
@@ -390,30 +444,34 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "3. Preserve the original information accurately without modifying facts.\n"
                 "4. Correct linguistic, grammatical, and spelling errors.\n"
                 "5. Adjust punctuation accurately according to linguistic rules to make the news appear professional.\n\n"
-                "DETAILED EDITING PROCESS:\n"
-                "1. Identify what to KEEP (official titles):\n"
-                "   ✅ خادم الحرمين الشريفين (keep)\n"
-                "   ✅ صاحب السمو الملكي (keep - it's official!)\n"
-                "   ✅ ولي العهد (keep)\n"
-                "   ✅ رئيس مجلس الوزراء (keep)\n\n"
-                "2. Identify what to REMOVE/SIMPLIFY (exaggeration):\n"
-                "   ❌ جلالة الملك → الملك\n"
-                "   ❌ صاحب الجلالة السلطان → السلطان\n"
-                "   ❌ حفظه الله, أيده الله, رعاه الله → DELETE\n"
-                "   ❌ المعظم, الجليل, خالص → DELETE\n\n"
-                "3. Apply replacements carefully:\n"
-                "   - Keep official titles: خادم الحرمين الشريفين, صاحب السمو الملكي\n"
-                "   - Simplify exaggerations: جلالة الملك → الملك\n"
-                "   - Remove prayer phrases completely\n"
-                "   - Preserve ال التعريف when simplifying (السلطان not سلطان)\n\n"
-                "4. Double-check:\n"
-                "   - Official titles still present? ✅\n"
-                "   - Prayer phrases deleted? ✅\n"
-                "   - Exaggerated words removed? ✅\n"
-                "   - ال التعريف preserved in simplified titles? ✅\n\n"
-                "5. Apply editorial style guidelines (objectivity, clarity, etc.).\n"
-                "6. Final verification: Ensure the balance between keeping official titles and removing exaggeration.\n"
-                "7. Rewrite the article according to UNA editorial style.\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📋 STEP-BY-STEP EDITING PROCESS:\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Step 1 - Scan for OFFICIAL TITLES to PRESERVE:\n"
+                "   ✅ Do you see 'خادم الحرمين الشريفين'? → KEEP IT!\n"
+                "   ✅ Do you see 'صاحب السمو الملكي'? → KEEP IT!\n"
+                "   ✅ Do you see 'ولي العهد'? → KEEP IT!\n"
+                "   ✅ Do you see 'رئيس مجلس الوزراء'? → KEEP IT!\n"
+                "   These are OFFICIAL STATE TITLES - like job titles - NOT exaggeration!\n\n"
+                "Step 2 - Scan for EXAGGERATION to REMOVE:\n"
+                "   ❌ Do you see 'جلالة الملك'? → Change to 'الملك'\n"
+                "   ❌ Do you see 'صاحب الجلالة السلطان'? → Change to 'السلطان'\n"
+                "   ❌ Do you see 'حفظه الله' or 'أيده الله'? → DELETE completely\n"
+                "   ❌ Do you see 'المعظم', 'الجليل', 'خالص'? → DELETE\n"
+                "   These are EXAGGERATED PRAISE - not official titles!\n\n"
+                "Step 3 - Apply changes CAREFULLY:\n"
+                "   • NEVER remove: خادم الحرمين الشريفين, صاحب السمو الملكي\n"
+                "   • ALWAYS remove: جلالة, صاحب الجلالة, فخامة\n"
+                "   • DELETE prayer phrases: حفظه الله, أيده الله, رعاه الله\n"
+                "   • When simplifying, preserve ال: السلطان (not سلطان), الملك (not ملك)\n\n"
+                "Step 4 - Final verification checklist:\n"
+                "   ✅ Is 'خادم الحرمين الشريفين' still there (if it was in original)?\n"
+                "   ✅ Is 'صاحب السمو الملكي' still there (if it was in original)?\n"
+                "   ✅ Are all prayer phrases ('حفظه الله', etc.) deleted?\n"
+                "   ✅ Are all exaggerations ('جلالة', 'المعظم', etc.) removed?\n"
+                "   ✅ Is ال التعريف preserved in simplified titles?\n\n"
+                "Step 5 - Apply editorial style guidelines (objectivity, clarity, etc.).\n\n"
+                "Step 6 - Rewrite the article according to UNA editorial style.\n\n"
                 "8. MANDATORY PARAGRAPH DIVISION - THIS IS CRITICAL AND NON-NEGOTIABLE:\n"
                 "   IMPORTANT: You MUST divide the article into multiple separate paragraphs.\n"
                 "   DO NOT write the article as a single continuous paragraph.\n"
