@@ -78,7 +78,7 @@ def ingest_docx(
     file_obj,
     document_type: DocumentChunk.DocumentType,
     title: str | None = None,
-    replace_existing: bool = True,
+    replace_existing: bool = False,
 ) -> List[DocumentChunk]:
     """
     Parse, chunk, embed, and persist DOCX content for the provided document type.
@@ -89,6 +89,18 @@ def ingest_docx(
     if not segments:
         raise ValueError("لم يتم العثور على نص داخل الملف المرفوع.")
 
+    # Determine the final title
+    final_title = title or source_name or document_type
+
+    # Check if a document with this title already exists
+    existing_chunks = DocumentChunk.objects.filter(
+        document_type=document_type,
+        title=final_title
+    ).exists()
+
+    if existing_chunks and not replace_existing:
+        raise ValueError(f"يوجد مستند بنفس العنوان '{final_title}' بالفعل. الرجاء اختيار عنوان آخر أو حذف المستند الموجود أولاً.")
+
     batches = _batch_segments(segments)
     embeddings = _embed_texts(batches)
 
@@ -97,13 +109,13 @@ def ingest_docx(
 
     with transaction.atomic():
         if replace_existing:
-            DocumentChunk.objects.filter(document_type=document_type).delete()
+            DocumentChunk.objects.filter(document_type=document_type, title=final_title).delete()
 
         created_chunks: List[DocumentChunk] = []
         for idx, (text, embedding) in enumerate(zip(batches, embeddings)):
             chunk = DocumentChunk.objects.create(
                 document_type=document_type,
-                title=title or source_name or document_type,
+                title=final_title,
                 source_name=source_name,
                 order=idx,
                 text=text,
@@ -153,6 +165,8 @@ def _preprocess_honorifics(text: str) -> str:
     """
     Preprocess text to remove excessive honorifics while keeping official titles.
 
+    IMPORTANT: This function preserves quoted text (text within quotation marks) unchanged.
+
     KEEP (Official Titles):
     - خادم الحرمين الشريفين (official title for Saudi King)
     - صاحب السمو الملكي (official title for Royal Highness)
@@ -163,7 +177,25 @@ def _preprocess_honorifics(text: str) -> str:
     - Prayer phrases: حفظه الله، أيده الله، رعاه الله
     - Exaggerated adjectives: المعظم، الجليل
     """
+    # Step 1: Extract and preserve quoted text
+    # Match various quotation mark styles: "...", «...», "...", '...'
+    quote_patterns = [
+        r'"([^"]+)"',      # Standard quotes
+        r'«([^»]+)»',      # Arabic quotes
+        r'"([^"]+)"',      # Curly double quotes
+        r"'([^']+)'",      # Single curly quotes
+    ]
+
+    # Store quoted texts with placeholders
+    quoted_texts = []
     processed_text = text
+
+    for pattern in quote_patterns:
+        matches = re.finditer(pattern, processed_text)
+        for match in matches:
+            placeholder = f"<<<QUOTE_{len(quoted_texts)}>>>"
+            quoted_texts.append(match.group(0))  # Store the full match including quotes
+            processed_text = processed_text.replace(match.group(0), placeholder, 1)
 
     # Define comprehensive replacement patterns (order matters - most specific first)
     replacements = [
@@ -212,13 +244,18 @@ def _preprocess_honorifics(text: str) -> str:
         (r'\bالجليل\s+', ''),  # When used as standalone adjective
     ]
 
-    # Apply all replacements
+    # Step 2: Apply all replacements (to non-quoted text)
     for pattern, replacement in replacements:
         processed_text = re.sub(pattern, replacement, processed_text, flags=re.IGNORECASE)
 
-    # Clean up multiple spaces and trim
+    # Step 3: Clean up multiple spaces and trim
     processed_text = re.sub(r'\s+', ' ', processed_text)
     processed_text = processed_text.strip()
+
+    # Step 4: Restore quoted texts
+    for i, quoted_text in enumerate(quoted_texts):
+        placeholder = f"<<<QUOTE_{i}>>>"
+        processed_text = processed_text.replace(placeholder, quoted_text)
 
     return processed_text
 
@@ -239,7 +276,9 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
 
     user_prompt = (
         "⚠️ CRITICAL OUTPUT FORMAT REQUIREMENT ⚠️\n"
-        "Your output MUST be divided into MULTIPLE paragraphs separated by blank lines.\n"
+        "Your output MUST include TWO parts:\n"
+        "1. TITLE/HEADLINE (first line) - The processed article title\n"
+        "2. ARTICLE BODY (following paragraphs) - Multiple paragraphs separated by blank lines\n\n"
         "DO NOT write the article as one continuous paragraph.\n"
         "Each paragraph = ONE main idea.\n"
         "Separate paragraphs with double newlines (\\n\\n).\n\n"
@@ -319,41 +358,109 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
         "✅ CORRECT: 'السلطان' (with ال), 'الملك' (with ال)\n"
         "❌ WRONG: 'سلطان' (without ال), 'ملك' (without ال)\n\n"
         "STEP-BY-STEP PROCESS:\n"
-        "1. Scan the entire article for ALL prohibited phrases listed in the guidelines.\n"
-        "2. Replace each prohibited phrase with its EXACT specified replacement, preserving ال التعريف when required.\n"
-        "3. Double-check that titles like 'السلطان' and 'الملك' always include ال التعريف.\n"
-        "4. Remove all prayer phrases (حفظه الله, رعاه الله, etc.) completely.\n"
-        "5. Rewrite the article according to UNA editorial style.\n"
-        "6. CRITICAL REQUIREMENT - PARAGRAPH DIVISION (MANDATORY):\n"
-        "   YOU MUST divide the article into MULTIPLE separate paragraphs. This is NOT optional.\n"
-        "   - NEVER return the article as one continuous block of text.\n"
-        "   - Each paragraph MUST be separated by TWO newlines (a blank line between paragraphs).\n"
-        "   - Each paragraph should focus on ONE main idea, event, or statement.\n"
-        "   - Minimum 3-5 paragraphs for most news articles (adjust based on content length).\n"
+        "1. IMPORTANT: DO NOT modify any text inside quotation marks (\"...\", «...», \"...\")!\n"
+        "   Quoted text must remain EXACTLY as it appears, including any honorifics or titles.\n"
+        "   Example: If someone said \"جلالة الملك المعظم\" in quotes, keep it unchanged!\n"
+        "2. Scan the entire article for ALL prohibited phrases listed in the guidelines (outside quotes).\n"
+        "3. Replace each prohibited phrase with its EXACT specified replacement, preserving ال التعريف when required.\n"
+        "4. Double-check that titles like 'السلطان' and 'الملك' always include ال التعريف.\n"
+        "5. Remove all prayer phrases (حفظه الله, رعاه الله, etc.) completely (outside quotes).\n"
+        "6. Rewrite the article according to UNA editorial style.\n"
+        "6. CRITICAL REQUIREMENT - OUTPUT FORMAT WITH TITLE (MANDATORY):\n"
+        "   YOUR OUTPUT MUST START WITH THE ARTICLE TITLE/HEADLINE, THEN THE ARTICLE BODY.\n"
         "\n"
-        "   PARAGRAPH STRUCTURE GUIDELINES:\n"
-        "   Paragraph 1: Opening - Main news announcement with key facts (who, what, when, where)\n"
-        "   Paragraph 2: Context/Details - Background information or event details\n"
-        "   Paragraph 3: Statements/Quotes - What officials said or actions taken\n"
-        "   Paragraph 4: Additional Information - Secondary details, attendees, or related information\n"
-        "   Paragraph 5: Conclusion - Closing remarks, future implications, or wrap-up\n"
+        "   ⚠️ IMPORTANT: The article title is the FIRST LINE of the article (before the city/date line).\n"
+        "   Example: 'جلالةُ السلطان المعظم ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية و6 مذكرات تفاهم'\n"
+        "   This is the TITLE/HEADLINE - you MUST process it and return it as the FIRST LINE of your output!\n"
         "\n"
-        "   EXAMPLE FORMAT (note the blank lines between paragraphs):\n"
-        "   المنامة في 10 نوفمبر / بنا / أكد ولي العهد رئيس مجلس الوزراء الأمير سلمان بن حمد آل خليفة...\n"
+        "   PROCESSING THE TITLE:\n"
+        "   - Apply the same honorific removal rules to the title\n"
+        "   - Remove exaggerations like 'جلالة', 'المعظم', 'حفظه الله'\n"
+        "   - Keep official titles like 'خادم الحرمين الشريفين', 'صاحب السمو الملكي'\n"
+        "   - Make the title concise and neutral\n"
+        "   Example transformation:\n"
+        "   ❌ BEFORE: 'جلالةُ السلطان المعظم ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية و6 مذكرات تفاهم'\n"
+        "   ✅ AFTER:  'السلطان ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية و6 مذكرات تفاهم'\n"
         "\n"
-        "   جاء ذلك لدى لقاء سموه اليوم في قصر القضيبية...\n"
+        "7. PARAGRAPH DIVISION (MANDATORY) - THIS IS ABSOLUTELY CRITICAL:\n"
+        "   🚨🚨🚨 YOU MUST PRESERVE THE PARAGRAPH STRUCTURE! 🚨🚨🚨\n"
         "\n"
-        "   وأشاد سموه بما تشهده سلطنة عُمان الشقيقة من نهضةٍ تنمويةٍ متواصلة...\n"
+        "   ⚠️ CRITICAL RULE: The input article already has paragraphs separated by blank lines (\\n\\n).\n"
+        "   You MUST maintain this paragraph structure in your output!\n"
         "\n"
-        "   كما جرى خلال اللقاء استعراض القضايا ذات الاهتمام المشترك...\n"
+        "   DO NOT merge all paragraphs into one continuous text!\n"
+        "   DO NOT rewrite the article as a single long paragraph!\n"
         "\n"
-        "   من جانبه، أعرب وزير الداخلية بسلطنة عُمان الشقيقة عن شكره...\n"
+        "   REQUIRED FORMAT:\n"
+        "   - Each paragraph from the input should remain a separate paragraph in the output\n"
+        "   - Separate EVERY paragraph with exactly TWO newlines (\\n\\n) to create blank lines\n"
+        "   - Each paragraph should be 2-4 sentences focusing on ONE main idea\n"
+        "   - Minimum 4-7 paragraphs for most news articles\n"
         "\n"
-        "7. Return ONLY the final revised news article in Arabic with PROPERLY SEPARATED PARAGRAPHS. No analysis or commentary.\n\n"
+        "   PARAGRAPH STRUCTURE (preserve from input):\n"
+        "   • Paragraph 1: Title/Headline\n"
+        "   • [BLANK LINE]\n"
+        "   • Paragraph 2: Opening with city/date and main announcement\n"
+        "   • [BLANK LINE]\n"
+        "   • Paragraph 3: Additional details or context\n"
+        "   • [BLANK LINE]\n"
+        "   • Paragraph 4: More specific information\n"
+        "   • [BLANK LINE]\n"
+        "   • Paragraph 5: Supporting details\n"
+        "   • [BLANK LINE]\n"
+        "   • Paragraph 6: More information\n"
+        "   • [BLANK LINE]\n"
+        "   • Final line: Closing tag '(انتهى)' or source tag 'العُمانية/' on its OWN separate line\n"
+        "\n"
+        "   ⚠️ CRITICAL: If the input article ends with 'العُمانية/' or similar source tag,\n"
+        "   keep it on a SEPARATE final line after a blank line!\n"
+        "\n"
+        "   🔴 REAL-WORLD COMPLETE EXAMPLE (EXACTLY HOW OUTPUT SHOULD LOOK):\n"
+        "\n"
+        "   السلطان ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية و6 مذكرات تفاهم\n"
+        "\n"
+        "   مدريد في 5 نوفمبر (يونا/العُمانية) - شهد السلطان هيثم بن طارق ورئيس الوزراء الإسباني بيدرو سانشيث اليوم في قصر مونكلوا بمدريد مراسم التوقيع على اتفاقية و6 مذكرات تفاهم بين البلدين الصديقين شملت العديد من المجالات، وذلك في إطار زيارة دولة يقوم بها السلطان إلى مملكة إسبانيا.\n"
+        "\n"
+        "   تمثلت الاتفاقية في الإعفاء المتبادل من التأشيرات لحاملي جوازات السفر الدبلوماسية والخاصة والخدمة بين سلطنة عُمان ومملكة إسبانيا.\n"
+        "\n"
+        "   شملت مذكرات التفاهم مجالات الثقافة والرياضة، وترويج الاستثمار، والمجالات الزراعية والحيوانية والسمكية والأمن الغذائي، وإدارة وحماية موارد المياه، والطاقة النظيفة، والنقل والبنية الأساسية.\n"
+        "\n"
+        "   وقع نيابة عن حكومة سلطنة عُمان كل من وزير الخارجية بدر بن حمد البوسعيدي، ووزير التجارة والصناعة وترويج الاستثمار قيس بن محمد اليوسف، ووزير الطاقة والمعادن سالم بن ناصر العوفي.\n"
+        "\n"
+        "   وعن حكومة مملكة إسبانيا كل من وزير الشؤون الخارجية والاتحاد الأوروبي والتعاون خوسيه مانويل ألباريس، ووزير الاقتصاد والتجارة والشركات كارلوس كويربو، ووزير الزراعة وصيد الأسماك والغذاء لويس بلاناس.\n"
+        "\n"
+        "   (انتهى)\n"
+        "\n"
+        "   ☝️ IMPORTANT NOTES:\n"
+        "   - Each paragraph is on its own line, with a BLANK LINE between paragraphs!\n"
+        "   - The closing tag '(انتهى)' or 'العُمانية/' is on a SEPARATE line at the end!\n"
+        "   - This is NOT one continuous block of text!\n"
+        "\n"
+        "8. Return ONLY the final revised news article in Arabic with THE TITLE FIRST, then PROPERLY SEPARATED PARAGRAPHS. No analysis or commentary.\n\n"
         "⚠️⚠️⚠️ FINAL REMINDER - READ THIS BEFORE OUTPUTTING ⚠️⚠️⚠️\n"
-        "Your response must contain AT LEAST 3-5 separate paragraphs with blank lines between them.\n"
-        "If you return the article as ONE paragraph, you have FAILED the task.\n"
-        "Format: Paragraph1\\n\\nParagraph2\\n\\nParagraph3\\n\\nParagraph4\\n\\nParagraph5\n"
+        "🚨 YOUR OUTPUT MUST HAVE MULTIPLE SEPARATE PARAGRAPHS WITH BLANK LINES BETWEEN THEM! 🚨\n"
+        "\n"
+        "Required structure:\n"
+        "1. Line 1: PROCESSED ARTICLE TITLE (with honorifics removed)\n"
+        "2. Line 2: BLANK LINE (\\n\\n)\n"
+        "3. Line 3: First paragraph (opening with city/date)\n"
+        "4. Line 4: BLANK LINE (\\n\\n)\n"
+        "5. Line 5: Second paragraph\n"
+        "6. Line 6: BLANK LINE (\\n\\n)\n"
+        "7. Line 7: Third paragraph\n"
+        "8. ...and so on for ALL paragraphs\n"
+        "\n"
+        "❌ WRONG (everything in one block):\n"
+        "العنوان\\n\\nمدريد في 5 نوفمبر - شهد السلطان... تمثلت الاتفاقية... شملت مذكرات... وقع نيابة... وعن حكومة...\n"
+        "\n"
+        "✅ CORRECT (separate paragraphs with blank lines):\n"
+        "العنوان\\n\\nمدريد في 5 نوفمبر - شهد السلطان...\\n\\nتمثلت الاتفاقية...\\n\\nشملت مذكرات...\\n\\nوقع نيابة...\\n\\nوعن حكومة...\\n\\n(انتهى)\n"
+        "\n"
+        "⚠️ IMPORTANT: The closing tag '(انتهى)' or 'العُمانية/' must be on a SEPARATE final line!\n"
+        "\n"
+        "If you do NOT include the title first → YOU FAILED!\n"
+        "If you merge paragraphs into one continuous text → YOU FAILED!\n"
+        "If you do NOT have blank lines between EVERY paragraph → YOU FAILED!\n"
     )
 
     return [
@@ -459,7 +566,12 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "   ❌ Do you see 'حفظه الله' or 'أيده الله'? → DELETE completely\n"
                 "   ❌ Do you see 'المعظم', 'الجليل', 'خالص'? → DELETE\n"
                 "   These are EXAGGERATED PRAISE - not official titles!\n\n"
-                "Step 3 - Apply changes CAREFULLY:\n"
+                "Step 3 - Apply changes CAREFULLY (but preserve quoted text):\n"
+                "   🚨 CRITICAL: DO NOT modify any text inside quotation marks!\n"
+                "   Text within quotes (\"...\", «...», \"...\") must remain UNCHANGED!\n"
+                "   Example: \"جلالة الملك المعظم\" in quotes stays exactly as is!\n"
+                "   \n"
+                "   For non-quoted text:\n"
                 "   • NEVER remove: خادم الحرمين الشريفين, صاحب السمو الملكي\n"
                 "   • ALWAYS remove: جلالة, صاحب الجلالة, فخامة\n"
                 "   • DELETE prayer phrases: حفظه الله, أيده الله, رعاه الله\n"
@@ -472,36 +584,125 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "   ✅ Is ال التعريف preserved in simplified titles?\n\n"
                 "Step 5 - Apply editorial style guidelines (objectivity, clarity, etc.).\n\n"
                 "Step 6 - Rewrite the article according to UNA editorial style.\n\n"
-                "8. MANDATORY PARAGRAPH DIVISION - THIS IS CRITICAL AND NON-NEGOTIABLE:\n"
-                "   IMPORTANT: You MUST divide the article into multiple separate paragraphs.\n"
-                "   DO NOT write the article as a single continuous paragraph.\n"
+                "8. MANDATORY OUTPUT FORMAT - TITLE FIRST, THEN SEPARATE PARAGRAPHS:\n"
+                "   🚨🚨🚨 CRITICAL: PRESERVE PARAGRAPH STRUCTURE WITH BLANK LINES! 🚨🚨🚨\n"
                 "\n"
-                "   a) Analyze the article content to identify distinct topics, ideas, or events.\n"
-                "   b) Create separate paragraphs for each distinct idea:\n"
-                "      - Paragraph 1: Main announcement/opening (who did what, when, where)\n"
-                "      - Paragraph 2: Event context and details (background, setting, attendees)\n"
-                "      - Paragraph 3: Main statements or actions (what was said or done)\n"
-                "      - Paragraph 4: Additional information (related details, secondary statements)\n"
-                "      - Paragraph 5: Conclusion (wrap-up, future implications, or closing remarks)\n"
-                "   c) Each paragraph should be 2-4 sentences maximum.\n"
-                "   d) CRITICAL: Separate each paragraph with TWO newline characters (\\n\\n) to create a blank line.\n"
-                "   e) Ensure logical flow and smooth transitions between paragraphs.\n"
-                "   f) The article MUST have at least 3-5 paragraphs unless the content is extremely short.\n"
+                "   a) IDENTIFY THE TITLE: The title is the FIRST LINE of the input article (before city/date).\n"
+                "      Example input title: 'جلالةُ السلطان المعظم ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية'\n"
                 "\n"
-                "   EXAMPLE OF CORRECT OUTPUT FORMAT:\n"
-                "   المنامة في 10 نوفمبر / بنا / أكد ولي العهد...\n"
-                "   [BLANK LINE]\n"
-                "   جاء ذلك لدى لقاء سموه اليوم...\n"
-                "   [BLANK LINE]\n"
-                "   وأشاد سموه بما تشهده سلطنة عُمان...\n"
-                "   [BLANK LINE]\n"
-                "   كما جرى خلال اللقاء استعراض...\n"
+                "   b) PROCESS THE TITLE: Apply honorific rules to clean the title:\n"
+                "      - Remove: 'جلالة', 'المعظم', 'حفظه الله', 'صاحب الجلالة'\n"
+                "      - Keep: 'خادم الحرمين الشريفين', 'صاحب السمو الملكي'\n"
+                "      Example output title: 'السلطان ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية'\n"
                 "\n"
-                "9. Deliver ONLY the final revised article text in Arabic with PROPERLY DIVIDED PARAGRAPHS; no analysis or explanations."
+                "   c) OUTPUT FORMAT - MULTIPLE SEPARATE PARAGRAPHS:\n"
+                "      Line 1: Processed title\n"
+                "      Line 2: BLANK LINE (\\n\\n)\n"
+                "      Line 3: First body paragraph (city/date + main news)\n"
+                "      Line 4: BLANK LINE (\\n\\n)\n"
+                "      Line 5: Second body paragraph\n"
+                "      Line 6: BLANK LINE (\\n\\n)\n"
+                "      Line 7: Third body paragraph\n"
+                "      ...and so on with BLANK LINES between EVERY paragraph\n"
+                "\n"
+                "   d) PARAGRAPH REQUIREMENTS:\n"
+                "      - DO NOT merge paragraphs into one continuous block!\n"
+                "      - Each paragraph = 2-4 sentences on ONE topic\n"
+                "      - Separate EVERY paragraph with \\n\\n (blank line)\n"
+                "      - Minimum 4-7 separate paragraphs for most articles\n"
+                "      - The input article already has paragraph breaks - PRESERVE THEM!\n"
+                "      - The closing tag '(انتهى)' or 'العُمانية/' must be on a SEPARATE final line!\n"
+                "\n"
+                "   e) COMPLETE REAL-WORLD EXAMPLE:\n"
+                "      السلطان ورئيس الوزراء الإسباني يشهدان توقيع اتفاقية و6 مذكرات تفاهم\n"
+                "      \n"
+                "      مدريد في 5 نوفمبر (يونا/العُمانية) - شهد السلطان هيثم بن طارق ورئيس الوزراء...\n"
+                "      \n"
+                "      تمثلت الاتفاقية في الإعفاء المتبادل من التأشيرات...\n"
+                "      \n"
+                "      شملت مذكرات التفاهم مجالات الثقافة والرياضة...\n"
+                "      \n"
+                "      وقع نيابة عن حكومة سلطنة عُمان كل من وزير الخارجية...\n"
+                "      \n"
+                "      وعن حكومة مملكة إسبانيا كل من وزير الشؤون الخارجية...\n"
+                "      \n"
+                "      (انتهى)\n"
+                "      \n"
+                "      ⚠️ NOTE: The closing tag '(انتهى)' or source tag like 'العُمانية/' must be on a SEPARATE final line!\n"
+                "\n"
+                "9. Deliver ONLY the final revised article in Arabic: TITLE first, then SEPARATE PARAGRAPHS with BLANK LINES between them; no analysis or explanations."
             ),
         },
         {"role": "user", "content": user_prompt},
     ]
+
+
+def _split_into_paragraphs(text: str) -> str:
+    """
+    Post-process the AI output to ensure proper paragraph separation.
+    This function intelligently splits text into paragraphs based on content patterns.
+    """
+    # If the text already has proper paragraph breaks, return as is
+    if "\n\n" in text and text.count("\n\n") >= 3:
+        return text
+
+    # Remove any existing single newlines (but preserve double newlines if they exist)
+    text = text.replace("\n\n", "<<<PARAGRAPH_BREAK>>>")
+    text = text.replace("\n", " ")
+    text = text.replace("<<<PARAGRAPH_BREAK>>>", "\n\n")
+
+    # Step 1: Separate the title from the body
+    # Look for city/date patterns like "مدريد في 5 نوفمبر" or "المنامة في"
+    city_date_pattern = r'(\S.*?)(\s+(?:مدريد|المنامة|الرياض|عمّان|القاهرة|دمشق|بغداد|مسقط|الكويت|المنامة|الدوحة|أبوظبي|بيروت|تونس|الجزائر|الرباط|طرابلس|نواكشوط|صنعاء|الخرطوم)\s+في\s+\d)'
+    match = re.search(city_date_pattern, text)
+
+    if match:
+        # Extract title and body
+        title = match.group(1).strip()
+        body = text[match.start(2):].strip()
+        text = f"{title}\n\n{body}"
+
+    # Step 2: Split by common paragraph starters
+    paragraph_starters = [
+        r'([.؟!])\s+(وأشاد)',
+        r'([.؟!])\s+(وأكد)',
+        r'([.؟!])\s+(وقال)',
+        r'([.؟!])\s+(وأضاف)',
+        r'([.؟!])\s+(جاء ذلك)',
+        r'([.؟!])\s+(وجاء)',
+        r'([.؟!])\s+(كما)',
+        r'([.؟!])\s+(وشهد)',
+        r'([.؟!])\s+(وشملت)',
+        r'([.؟!])\s+(وتمثّلت)',
+        r'([.؟!])\s+(تمثلت)',
+        r'([.؟!])\s+(شملت)',
+        r'([.؟!])\s+(ووقع)',
+        r'([.؟!])\s+(وقّع)',
+        r'([.؟!])\s+(وقع)',
+        r'([.؟!])\s+(وعن)',
+        r'([.؟!])\s+(من جانبه)',
+        r'([.؟!])\s+(من جهته)',
+        r'([.؟!])\s+(من جانبها)',
+        r'([.؟!])\s+(بدوره)',
+    ]
+
+    # Apply paragraph splitting
+    for pattern in paragraph_starters:
+        text = re.sub(pattern, r'\1\n\n\2', text)
+
+    # Step 3: Ensure closing tags are on separate lines
+    text = re.sub(r'([.؟!])\s*(\(انتهى\))', r'\1\n\n\2', text)
+    text = re.sub(r'([.؟!])\s*(العُمانية/)', r'\1\n\n\2', text)
+
+    # Handle case where closing tag is at the end without punctuation
+    text = re.sub(r'(\S)\s+(\(انتهى\))', r'\1\n\n\2', text)
+    text = re.sub(r'(\S)\s+(العُمانية/)', r'\1\n\n\2', text)
+
+    # Step 4: Clean up any triple or more newlines
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+
+    return text.strip()
 
 
 def generate_review(
@@ -513,7 +714,7 @@ def generate_review(
 ) -> str:
     client = _get_openai_client()
     messages = build_review_prompt(news_text, guideline_chunks, example_chunks)
-    
+
     result_text = ""
     if hasattr(client, "responses"):
         response = client.responses.create(model=model, input=messages)
@@ -526,17 +727,20 @@ def generate_review(
                 result_text = response.choices[0].message.content.strip()
         else:
             raise RuntimeError("OpenAI client does not support responses or chat completions API.")
-    
+
     # Check if the model rejected the text as inappropriate or random
     if result_text.startswith("ERROR:") or "غير مناسب" in result_text or "غير صالح" in result_text:
         error_msg = result_text.replace("ERROR:", "").strip()
         if not error_msg:
             error_msg = "النص المقدم غير مناسب أو غير صالح للمعالجة. يرجى تقديم خبر صحيح."
         raise ValueError(error_msg)
-    
+
     # Final pass: ensure any remaining honorifics are processed
     # This catches any honorifics the model might have missed
     final_text = _preprocess_honorifics(result_text)
-    
+
+    # Post-process to ensure proper paragraph separation
+    final_text = _split_into_paragraphs(final_text)
+
     return final_text
 
