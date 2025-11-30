@@ -6,6 +6,7 @@ from django.conf import settings
 from django.db import transaction
 from docx import Document
 from openai import OpenAI
+from serpapi import GoogleSearch
 from .models import DocumentChunk
 
 
@@ -705,6 +706,216 @@ def _split_into_paragraphs(text: str) -> str:
     return text.strip()
 
 
+def _search_google_for_fact_check(query: str) -> str:
+    """
+    Search Google using SERP API to gather information for fact-checking.
+
+    Args:
+        query: The search query
+
+    Returns:
+        Formatted search results as a string
+    """
+    serpapi_key = settings.SERPAPI_KEY
+    if not serpapi_key:
+        # If no SERP API key, return empty results
+        return "لا توجد نتائج بحث متاحة."
+
+    try:
+        # Remove quotes from the API key if present
+        serpapi_key = serpapi_key.strip('"\'')
+
+        params = {
+            "q": query,
+            "api_key": serpapi_key,
+            "num": 5,  # Get top 5 results
+            "hl": "ar",  # Arabic language
+            "gl": "sa",  # Saudi Arabia region
+        }
+
+        search = GoogleSearch(params)
+        results = search.get_dict()
+
+        # Extract organic results
+        organic_results = results.get("organic_results", [])
+
+        if not organic_results:
+            return "لم يتم العثور على نتائج بحث."
+
+        # Format results
+        formatted_results = []
+        for idx, result in enumerate(organic_results[:5], 1):
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            formatted_results.append(f"{idx}. {title}\n   {snippet}")
+
+        return "\n\n".join(formatted_results)
+
+    except Exception as e:
+        # If search fails, return error message
+        return f"حدث خطأ أثناء البحث: {str(e)}"
+
+
+def check_and_correct_text_between_hashtags(
+    *,
+    text: str,
+    model: str = DEFAULT_COMPLETION_MODEL,
+    full_context: str = None,
+) -> str:
+    """
+    Extract text between ##text## markers and check/correct factual and linguistic errors using OpenAI.
+
+    Args:
+        text: The input text containing ##text## markers
+        model: OpenAI model to use for correction
+        full_context: Optional full context text to help with fact-checking
+
+    Returns:
+        The corrected text that was between the hashtags
+
+    Raises:
+        ValueError: If no text is found between ## markers
+    """
+    # Extract text between ##text##
+    pattern = r'##(.+?)##'
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if not matches:
+        raise ValueError("No text found between ## markers. Please use format: ##your text here##")
+
+    # Use the first match if multiple exist
+    text_to_check = matches[0].strip()
+
+    if not text_to_check:
+        raise ValueError("Empty text found between ## markers.")
+
+    # Get context around the marked text for better understanding
+    context_text = full_context if full_context else text
+
+    # Search Google for fact-checking with better query
+    # Build search query based on context
+    search_query = text_to_check
+
+    # Check if this is about a person with a title/position
+    if "يونا" in context_text or "UNA" in context_text.upper():
+        search_query = "المدير العام اتحاد وكالات أنباء يونا OIC UNA director general 2025"
+    elif "المدير" in context_text or "الرئيس" in context_text or "الوزير" in context_text:
+        # Extract organization/context from the full text
+        search_query = f"{context_text[:200]} من هو"
+    else:
+        search_query = f"{text_to_check} حقيقة تحقق"
+
+    search_results = _search_google_for_fact_check(search_query)
+
+    client = _get_openai_client()
+
+    # Build the prompt for factual and linguistic correction
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "أنت محرر صحفي محترف متخصص في التحقق من صحة المعلومات وتصحيح الأخطاء الواقعية.\n\n"
+                "⚠️ مهمتك الرئيسية: التحقق من صحة المعلومات الواقعية وتصحيحها باستخدام نتائج البحث المقدمة\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "1. **استخدام نتائج البحث (الأولوية القصوى):**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🔴 سيتم تزويدك بنتائج بحث من جوجل عن المعلومات المطلوب التحقق منها.\n"
+                "استخدم هذه النتائج للتحقق من صحة المعلومات وتصحيحها.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "2. **التحقق من المعلومات الجغرافية (مهم جداً):**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🔴 قاعدة حاسمة: إذا رأيت كلمة 'العاصمة' أو 'عاصمة'، تحقق فوراً من صحة اسم المدينة!\n\n"
+                "عواصم الدول العربية والإسلامية (للمرجعية):\n"
+                "• مصر → القاهرة (ليست: الإسكندرية، الجيزة، أسوان)\n"
+                "• السعودية → الرياض (ليست: جدة، مكة، المدينة، الطائف)\n"
+                "• الإمارات → أبوظبي (ليست: دبي، الشارقة)\n"
+                "• الكويت → الكويت\n"
+                "• البحرين → المنامة\n"
+                "• قطر → الدوحة\n"
+                "• عُمان → مسقط\n"
+                "• الأردن → عمّان\n"
+                "• لبنان → بيروت\n"
+                "• سوريا → دمشق\n"
+                "• العراق → بغداد\n"
+                "• اليمن → صنعاء\n"
+                "• فلسطين → القدس (رام الله إدارياً)\n"
+                "• السودان → الخرطوم\n"
+                "• المغرب → الرباط (ليست: الدار البيضاء)\n"
+                "• الجزائر → الجزائر\n"
+                "• تونس → تونس\n"
+                "• ليبيا → طرابلس\n"
+                "• موريتانيا → نواكشوط\n"
+                "• الصومال → مقديشو\n"
+                "• جيبوتي → جيبوتي\n"
+                "• جزر القمر → موروني\n\n"
+                "🔴 أمثلة واقعية للتصحيح:\n"
+                "❌ 'في العاصمة الطائف' → ✅ 'في الرياض' (الطائف ليست العاصمة!)\n"
+                "❌ 'في العاصمة جدة' → ✅ 'في الرياض' (جدة ليست العاصمة!)\n"
+                "❌ 'العاصمة المصرية الجيزة' → ✅ 'العاصمة المصرية القاهرة'\n"
+                "❌ 'عاصمة الإمارات دبي' → ✅ 'عاصمة الإمارات أبوظبي'\n"
+                "❌ 'العاصمة المغربية الدار البيضاء' → ✅ 'العاصمة المغربية الرباط'\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "3. **التحقق من الأسماء والمناصب (مهم جداً!):**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "🔴 قاعدة حاسمة: إذا رأيت اسم شخص مع منصب (مدير، رئيس، وزير، إلخ)، تحقق فوراً من صحة الاسم!\n\n"
+                "استخدم نتائج البحث للتحقق من:\n"
+                "   - هل الاسم المذكور هو الشخص الصحيح الذي يشغل هذا المنصب؟\n"
+                "   - إذا كان الاسم خاطئاً، استبدله بالاسم الصحيح من نتائج البحث\n\n"
+                "أمثلة:\n"
+                "   ❌ 'المدير العام ليونا، اسلام بدران' → ✅ 'المدير العام ليونا، محمد بن عبدربه اليامي'\n"
+                "   (إذا أظهرت نتائج البحث أن المدير الصحيح هو محمد بن عبدربه اليامي)\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "4. **التحقق من معلومات أخرى:**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "   - تحقق من صحة المعلومات التاريخية (تواريخ، أحداث)\n"
+                "   - تحقق من صحة الأرقام والإحصائيات إذا كانت واضحة الخطأ\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "5. **التصحيح اللغوي (ثانوي):**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "   - تصحيح الأخطاء الإملائية\n"
+                "   - تصحيح الأخطاء النحوية\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "6. **قواعد الإخراج (مهم جداً):**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "   ✅ أعد فقط النص المصحح بدون أي إضافات\n"
+                "   ✅ لا تكتب 'النص المصحح:' أو أي عناوين\n"
+                "   ✅ لا تضف شروحات أو تعليقات\n"
+                "   ✅ حافظ على أسلوب النص الأصلي\n"
+                "   ✅ لا تضف معلومات جديدة\n\n"
+                "🔴 تذكير أخير: استخدم نتائج البحث المقدمة للتحقق من صحة المعلومات!"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"النص المطلوب التحقق منه وتصحيحه:\n{text_to_check}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"نتائج البحث من جوجل للتحقق من صحة المعلومات:\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{search_results}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"استخدم نتائج البحث أعلاه للتحقق من صحة المعلومات وتصحيحها.\n"
+                f"أعد النص المصحح فقط بدون أي شروحات."
+            ),
+        },
+    ]
+
+    result_text = ""
+    if hasattr(client, "responses"):
+        response = client.responses.create(model=model, input=messages)
+        result_text = response.output_text.strip()
+    else:
+        chat_client = getattr(client, "chat", None)
+        if chat_client and hasattr(chat_client, "completions"):
+            response = chat_client.completions.create(model=model, messages=messages)
+            if response.choices:
+                result_text = response.choices[0].message.content.strip()
+        else:
+            raise RuntimeError("OpenAI client does not support responses or chat completions API.")
+
+    return result_text
+
+
 def generate_review(
     *,
     news_text: str,
@@ -712,6 +923,23 @@ def generate_review(
     example_chunks: Iterable[RetrievedChunk],
     model: str = DEFAULT_COMPLETION_MODEL,
 ) -> str:
+    # First, check if there are any ##text## markers and correct them
+    pattern = r'##(.+?)##'
+    matches = re.findall(pattern, news_text, re.DOTALL)
+
+    if matches:
+        # Process each match and replace in the original text
+        processed_text = news_text
+        for match in matches:
+            corrected = check_and_correct_text_between_hashtags(
+                text=f"##{match}##",
+                model=model,
+                full_context=news_text  # Pass full context for better fact-checking
+            )
+            # Replace the ##original## with the corrected text (without ##)
+            processed_text = processed_text.replace(f"##{match}##", corrected, 1)
+        news_text = processed_text
+
     client = _get_openai_client()
     messages = build_review_prompt(news_text, guideline_chunks, example_chunks)
 

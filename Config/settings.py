@@ -146,6 +146,7 @@ MEDIA_ROOT = BASE_DIR / 'media'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+SERPAPI_KEY = os.getenv('SERPAPI_KEY')
 
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
