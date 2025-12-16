@@ -1,19 +1,32 @@
 from __future__ import annotations
+import asyncio
+import io
 import re
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple, Optional, Callable, Any
 from django.conf import settings
 from django.db import transaction
 from docx import Document
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from serpapi import GoogleSearch
-from .models import DocumentChunk
+from asgiref.sync import sync_to_async
+from .models import DocumentChunk, FileUploadBatch, UploadedFile
 
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_COMPLETION_MODEL = "gpt-4.1"
 MAX_CHUNK_CHAR_LENGTH = 4000
+# OpenAI embedding limits: 8191 tokens per text, batch up to ~2000 texts
+# For large documents, process embeddings in smaller batches to avoid rate limits
+EMBEDDING_BATCH_SIZE = 100  # Number of texts to embed at once (increased for speed)
+EMBEDDING_RETRY_DELAY = 1  # Seconds to wait between retries (reduced)
+MAX_EMBEDDING_RETRIES = 5  # Maximum retry attempts for rate limits
+MAX_CONCURRENT_EMBEDDINGS = 5  # Maximum concurrent embedding API calls
 
 
 @dataclass
@@ -27,6 +40,14 @@ def _get_openai_client() -> OpenAI:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY env var must be set before calling OpenAI APIs.")
     return OpenAI(api_key=api_key)
+
+
+def _get_async_openai_client() -> AsyncOpenAI:
+    """Get an async OpenAI client for concurrent operations."""
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY env var must be set before calling OpenAI APIs.")
+    return AsyncOpenAI(api_key=api_key)
 
 
 def _extract_text_segments(file_obj) -> List[str]:
@@ -74,15 +95,88 @@ def _embed_texts(texts: Sequence[str], *, model: str = DEFAULT_EMBEDDING_MODEL) 
     return [item.embedding for item in response.data]
 
 
+def _embed_texts_chunked(
+    texts: Sequence[str],
+    *,
+    model: str = DEFAULT_EMBEDDING_MODEL,
+    batch_size: int = EMBEDDING_BATCH_SIZE,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> List[List[float]]:
+    """
+    Embed texts in smaller batches to handle large documents and avoid rate limits.
+
+    Args:
+        texts: List of text segments to embed
+        model: OpenAI embedding model to use
+        batch_size: Number of texts to embed per API call
+        progress_callback: Optional callback(processed, total) for progress tracking
+
+    Returns:
+        List of embedding vectors in the same order as input texts
+    """
+    if not texts:
+        return []
+
+    client = _get_openai_client()
+    all_embeddings: List[List[float]] = []
+    total_texts = len(texts)
+
+    for i in range(0, total_texts, batch_size):
+        batch = texts[i:i + batch_size]
+
+        # Retry logic for rate limits
+        for attempt in range(MAX_EMBEDDING_RETRIES):
+            try:
+                response = client.embeddings.create(model=model, input=list(batch))
+                batch_embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(batch_embeddings)
+
+                if progress_callback:
+                    progress_callback(min(i + batch_size, total_texts), total_texts)
+
+                break  # Success, exit retry loop
+
+            except Exception as e:
+                error_str = str(e).lower()
+                if "rate" in error_str or "limit" in error_str or "429" in error_str:
+                    if attempt < MAX_EMBEDDING_RETRIES - 1:
+                        wait_time = EMBEDDING_RETRY_DELAY * (attempt + 1)
+                        logger.warning(f"Rate limit hit, waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    else:
+                        raise RuntimeError(f"Rate limit exceeded after {MAX_EMBEDDING_RETRIES} retries: {e}")
+                else:
+                    raise RuntimeError(f"Embedding API error: {e}")
+
+        # Small delay between batches to avoid rate limits
+        if i + batch_size < total_texts:
+            time.sleep(0.1)
+
+    return all_embeddings
+
+
 def ingest_docx(
     *,
     file_obj,
     document_type: DocumentChunk.DocumentType,
     title: str | None = None,
     replace_existing: bool = False,
+    use_chunked_embedding: bool = True,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[DocumentChunk]:
     """
     Parse, chunk, embed, and persist DOCX content for the provided document type.
+
+    Args:
+        file_obj: File-like object containing the DOCX document
+        document_type: Type of document (guideline or example)
+        title: Optional title override
+        replace_existing: Whether to replace existing documents with same title
+        use_chunked_embedding: Use chunked embedding for large documents (default True)
+        progress_callback: Optional callback(processed, total) for progress tracking
+
+    Returns:
+        List of created DocumentChunk objects
     """
     source_name = getattr(file_obj, "name", "") or ""
     file_obj.seek(0)
@@ -103,7 +197,12 @@ def ingest_docx(
         raise ValueError(f"يوجد مستند بنفس العنوان '{final_title}' بالفعل. الرجاء اختيار عنوان آخر أو حذف المستند الموجود أولاً.")
 
     batches = _batch_segments(segments)
-    embeddings = _embed_texts(batches)
+
+    # Use chunked embedding for large documents (> 10 batches)
+    if use_chunked_embedding and len(batches) > 10:
+        embeddings = _embed_texts_chunked(batches, progress_callback=progress_callback)
+    else:
+        embeddings = _embed_texts(batches)
 
     if len(batches) != len(embeddings):
         raise RuntimeError("Embedding count mismatch while processing DOCX.")
@@ -126,6 +225,491 @@ def ingest_docx(
             created_chunks.append(chunk)
 
     return created_chunks
+
+
+def ingest_multiple_docx(
+    *,
+    files: List[Tuple],  # List of (file_obj, optional_title) tuples
+    document_type: DocumentChunk.DocumentType,
+    replace_existing: bool = False,
+) -> FileUploadBatch:
+    """
+    Process multiple DOCX files in a single batch operation.
+
+    This function handles large documents efficiently by:
+    1. Processing files sequentially to manage memory
+    2. Using chunked embeddings to handle OpenAI rate limits
+    3. Tracking progress at the file and batch level
+
+    Args:
+        files: List of (file_object, optional_title) tuples
+        document_type: Type of documents (guideline or example)
+        replace_existing: Whether to replace existing documents with same titles
+
+    Returns:
+        FileUploadBatch object with processing results
+    """
+    # Create batch record
+    batch = FileUploadBatch.objects.create(
+        document_type=document_type,
+        status=FileUploadBatch.Status.PROCESSING,
+        total_files=len(files),
+    )
+
+    # Create file records
+    file_records: List[UploadedFile] = []
+    for file_obj, title in files:
+        filename = getattr(file_obj, "name", "") or f"file_{len(file_records)}.docx"
+        file_size = 0
+        try:
+            file_obj.seek(0, 2)  # Seek to end
+            file_size = file_obj.tell()
+            file_obj.seek(0)  # Reset to beginning
+        except Exception:
+            pass
+
+        file_record = UploadedFile.objects.create(
+            batch=batch,
+            filename=filename,
+            title=title or "",
+            file_size=file_size,
+            status=UploadedFile.Status.PENDING,
+        )
+        file_records.append(file_record)
+
+    total_chunks = 0
+    processed = 0
+    errors = []
+
+    # Process each file
+    for idx, ((file_obj, title), file_record) in enumerate(zip(files, file_records)):
+        try:
+            file_record.status = UploadedFile.Status.PROCESSING
+            file_record.save()
+
+            # Use title from parameter or from file record
+            use_title = title or file_record.title or None
+
+            chunks = ingest_docx(
+                file_obj=file_obj,
+                document_type=document_type,
+                title=use_title,
+                replace_existing=replace_existing,
+                use_chunked_embedding=True,
+            )
+
+            file_record.status = UploadedFile.Status.COMPLETED
+            file_record.chunks_created = len(chunks)
+            file_record.save()
+
+            total_chunks += len(chunks)
+            processed += 1
+
+        except Exception as e:
+            error_msg = str(e)
+            file_record.status = UploadedFile.Status.FAILED
+            file_record.error_message = error_msg
+            file_record.save()
+            errors.append(f"{file_record.filename}: {error_msg}")
+            logger.error(f"Error processing {file_record.filename}: {e}")
+
+        # Update batch progress
+        batch.processed_files = processed
+        batch.total_chunks_created = total_chunks
+        batch.save()
+
+    # Update final batch status
+    if errors:
+        if processed == 0:
+            batch.status = FileUploadBatch.Status.FAILED
+        else:
+            batch.status = FileUploadBatch.Status.COMPLETED  # Partial success
+        batch.error_message = "\n".join(errors)
+    else:
+        batch.status = FileUploadBatch.Status.COMPLETED
+
+    batch.save()
+    return batch
+
+
+def get_batch_status(batch_id: str) -> dict:
+    """
+    Get the current status of a batch upload.
+
+    Args:
+        batch_id: UUID of the batch
+
+    Returns:
+        Dictionary with batch status and file details
+    """
+    try:
+        batch = FileUploadBatch.objects.get(id=batch_id)
+    except FileUploadBatch.DoesNotExist:
+        raise ValueError(f"Batch {batch_id} not found")
+
+    files_info = []
+    for f in batch.files.all():
+        files_info.append({
+            "filename": f.filename,
+            "title": f.title,
+            "status": f.status,
+            "chunks_created": f.chunks_created,
+            "file_size": f.file_size,
+            "error_message": f.error_message,
+        })
+
+    progress = 0.0
+    if batch.total_files > 0:
+        progress = (batch.processed_files / batch.total_files) * 100
+
+    return {
+        "batch_id": str(batch.id),
+        "document_type": batch.document_type,
+        "status": batch.status,
+        "total_files": batch.total_files,
+        "processed_files": batch.processed_files,
+        "total_chunks_created": batch.total_chunks_created,
+        "progress_percentage": round(progress, 2),
+        "error_message": batch.error_message,
+        "files": files_info,
+        "created_at": batch.created_at.isoformat(),
+        "updated_at": batch.updated_at.isoformat(),
+    }
+
+
+# =============================================================================
+# ASYNC PROCESSING FUNCTIONS FOR BIG DATA HANDLING
+# =============================================================================
+
+async def _async_embed_texts(
+    texts: Sequence[str],
+    *,
+    model: str = DEFAULT_EMBEDDING_MODEL,
+) -> List[List[float]]:
+    """
+    Asynchronously embed texts using OpenAI's async client.
+
+    Args:
+        texts: List of text segments to embed
+        model: OpenAI embedding model to use
+
+    Returns:
+        List of embedding vectors in the same order as input texts
+    """
+    if not texts:
+        return []
+
+    client = _get_async_openai_client()
+    response = await client.embeddings.create(model=model, input=list(texts))
+    return [item.embedding for item in response.data]
+
+
+async def _async_embed_texts_chunked(
+    texts: Sequence[str],
+    *,
+    model: str = DEFAULT_EMBEDDING_MODEL,
+    batch_size: int = EMBEDDING_BATCH_SIZE,
+    max_concurrent: int = MAX_CONCURRENT_EMBEDDINGS,
+) -> List[List[float]]:
+    """
+    Asynchronously embed texts in batches with concurrency control.
+
+    This function handles large documents by:
+    1. Breaking texts into smaller batches
+    2. Processing batches concurrently (with limits to avoid rate limits)
+    3. Implementing retry logic for rate limit errors
+
+    Args:
+        texts: List of text segments to embed
+        model: OpenAI embedding model to use
+        batch_size: Number of texts per batch
+        max_concurrent: Maximum concurrent API calls
+
+    Returns:
+        List of embedding vectors in the same order as input texts
+    """
+    if not texts:
+        return []
+
+    client = _get_async_openai_client()
+    all_embeddings: List[Optional[List[float]]] = [None] * len(texts)
+    total_texts = len(texts)
+
+    # Create batches with their indices
+    batches = []
+    for i in range(0, total_texts, batch_size):
+        batch_texts = texts[i:i + batch_size]
+        batch_indices = list(range(i, min(i + batch_size, total_texts)))
+        batches.append((batch_indices, batch_texts))
+
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def process_batch(batch_indices: List[int], batch_texts: List[str]) -> None:
+        async with semaphore:
+            for attempt in range(MAX_EMBEDDING_RETRIES):
+                try:
+                    response = await client.embeddings.create(
+                        model=model,
+                        input=list(batch_texts)
+                    )
+                    for idx, item in zip(batch_indices, response.data):
+                        all_embeddings[idx] = item.embedding
+                    return
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "rate" in error_str or "limit" in error_str or "429" in error_str:
+                        if attempt < MAX_EMBEDDING_RETRIES - 1:
+                            wait_time = EMBEDDING_RETRY_DELAY * (attempt + 1)
+                            logger.warning(f"Rate limit hit, waiting {wait_time}s before retry...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            raise RuntimeError(f"Rate limit exceeded after {MAX_EMBEDDING_RETRIES} retries: {e}")
+                    else:
+                        raise RuntimeError(f"Embedding API error: {e}")
+
+    # Process all batches concurrently
+    await asyncio.gather(*[
+        process_batch(indices, texts_batch)
+        for indices, texts_batch in batches
+    ])
+
+    return all_embeddings
+
+
+async def async_ingest_docx(
+    *,
+    file_content: bytes,
+    filename: str,
+    document_type: DocumentChunk.DocumentType,
+    title: str | None = None,
+    replace_existing: bool = False,
+) -> List[DocumentChunk]:
+    """
+    Asynchronously parse, chunk, embed, and persist DOCX content.
+
+    This is the async version of ingest_docx for handling multiple files concurrently.
+
+    Args:
+        file_content: Raw bytes of the DOCX file
+        filename: Name of the file
+        document_type: Type of document (guideline or example)
+        title: Optional title override
+        replace_existing: Whether to replace existing documents with same title
+
+    Returns:
+        List of created DocumentChunk objects
+    """
+    # Parse DOCX in a thread pool (python-docx is not async)
+    loop = asyncio.get_event_loop()
+
+    def extract_segments():
+        file_obj = io.BytesIO(file_content)
+        document = Document(file_obj)
+        segments = []
+        for paragraph in document.paragraphs:
+            text = paragraph.text.strip()
+            if text:
+                segments.append(text)
+        return segments
+
+    with ThreadPoolExecutor() as executor:
+        segments = await loop.run_in_executor(executor, extract_segments)
+
+    if not segments:
+        raise ValueError("لم يتم العثور على نص داخل الملف المرفوع.")
+
+    # Determine the final title
+    final_title = title or filename or document_type
+
+    # Check if a document with this title already exists (sync DB operation)
+    @sync_to_async
+    def check_existing():
+        return DocumentChunk.objects.filter(
+            document_type=document_type,
+            title=final_title
+        ).exists()
+
+    existing_chunks = await check_existing()
+
+    if existing_chunks and not replace_existing:
+        raise ValueError(
+            f"يوجد مستند بنفس العنوان '{final_title}' بالفعل. "
+            "الرجاء اختيار عنوان آخر أو حذف المستند الموجود أولاً."
+        )
+
+    # Batch segments
+    batches = _batch_segments(segments)
+
+    # Embed texts asynchronously
+    if len(batches) > 10:
+        embeddings = await _async_embed_texts_chunked(batches)
+    else:
+        embeddings = await _async_embed_texts(batches)
+
+    if len(batches) != len(embeddings):
+        raise RuntimeError("Embedding count mismatch while processing DOCX.")
+
+    # Save to database (sync operation wrapped in async)
+    @sync_to_async
+    def save_chunks():
+        with transaction.atomic():
+            if replace_existing:
+                DocumentChunk.objects.filter(
+                    document_type=document_type,
+                    title=final_title
+                ).delete()
+
+            created_chunks: List[DocumentChunk] = []
+            for idx, (text, embedding) in enumerate(zip(batches, embeddings)):
+                chunk = DocumentChunk.objects.create(
+                    document_type=document_type,
+                    title=final_title,
+                    source_name=filename,
+                    order=idx,
+                    text=text,
+                    embedding=embedding,
+                    metadata={"segment_count": len(text.splitlines())},
+                )
+                created_chunks.append(chunk)
+            return created_chunks
+
+    return await save_chunks()
+
+
+async def async_ingest_multiple_docx(
+    *,
+    files_data: List[Tuple[bytes, str, Optional[str]]],  # (content, filename, title)
+    document_type: DocumentChunk.DocumentType,
+    replace_existing: bool = False,
+    max_concurrent_files: int = 3,
+) -> FileUploadBatch:
+    """
+    Asynchronously process multiple DOCX files concurrently.
+
+    This function handles big data (multiple large files) efficiently by:
+    1. Processing files concurrently with controlled parallelism
+    2. Using async embeddings to avoid blocking
+    3. Tracking progress at file and batch levels
+
+    Args:
+        files_data: List of (file_content_bytes, filename, optional_title) tuples
+        document_type: Type of documents (guideline or example)
+        replace_existing: Whether to replace existing documents with same titles
+        max_concurrent_files: Maximum files to process concurrently
+
+    Returns:
+        FileUploadBatch object with processing results
+    """
+    # Create batch record
+    @sync_to_async
+    def create_batch():
+        return FileUploadBatch.objects.create(
+            document_type=document_type,
+            status=FileUploadBatch.Status.PROCESSING,
+            total_files=len(files_data),
+        )
+
+    batch = await create_batch()
+
+    # Create file records
+    @sync_to_async
+    def create_file_records():
+        records = []
+        for content, filename, title in files_data:
+            record = UploadedFile.objects.create(
+                batch=batch,
+                filename=filename,
+                title=title or "",
+                file_size=len(content),
+                status=UploadedFile.Status.PENDING,
+            )
+            records.append(record)
+        return records
+
+    file_records = await create_file_records()
+
+    results = {
+        "total_chunks": 0,
+        "processed": 0,
+        "errors": [],
+    }
+
+    semaphore = asyncio.Semaphore(max_concurrent_files)
+
+    async def process_file(
+        file_data: Tuple[bytes, str, Optional[str]],
+        file_record: UploadedFile
+    ):
+        async with semaphore:
+            content, filename, title = file_data
+
+            @sync_to_async
+            def update_status(status, chunks=0, error=""):
+                file_record.status = status
+                if chunks:
+                    file_record.chunks_created = chunks
+                if error:
+                    file_record.error_message = error
+                file_record.save()
+
+            try:
+                await update_status(UploadedFile.Status.PROCESSING)
+
+                chunks = await async_ingest_docx(
+                    file_content=content,
+                    filename=filename,
+                    document_type=document_type,
+                    title=title,
+                    replace_existing=replace_existing,
+                )
+
+                await update_status(UploadedFile.Status.COMPLETED, len(chunks))
+                results["total_chunks"] += len(chunks)
+                results["processed"] += 1
+
+            except Exception as e:
+                error_msg = str(e)
+                await update_status(UploadedFile.Status.FAILED, error=error_msg)
+                results["errors"].append(f"{filename}: {error_msg}")
+                logger.error(f"Error processing {filename}: {e}")
+
+            # Update batch progress
+            @sync_to_async
+            def update_batch_progress():
+                batch.processed_files = results["processed"]
+                batch.total_chunks_created = results["total_chunks"]
+                batch.save()
+
+            await update_batch_progress()
+
+    # Process all files concurrently
+    await asyncio.gather(*[
+        process_file(file_data, file_record)
+        for file_data, file_record in zip(files_data, file_records)
+    ])
+
+    # Update final batch status
+    @sync_to_async
+    def finalize_batch():
+        if results["errors"]:
+            if results["processed"] == 0:
+                batch.status = FileUploadBatch.Status.FAILED
+            else:
+                batch.status = FileUploadBatch.Status.COMPLETED  # Partial success
+            batch.error_message = "\n".join(results["errors"])
+        else:
+            batch.status = FileUploadBatch.Status.COMPLETED
+        batch.save()
+
+    await finalize_batch()
+
+    # Refresh batch from DB
+    @sync_to_async
+    def refresh_batch():
+        batch.refresh_from_db()
+        return batch
+
+    return await refresh_batch()
 
 
 def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
@@ -289,12 +873,37 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔴 قاعدة الجنسية في العناوين 🔴\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "أضف الجنسية بعد المنصب مباشرة:\n"
-        "• 'رئيس الوزراء' → 'رئيس الوزراء العراقي' (إذا كان الخبر من العراق)\n"
-        "• 'الملك' → 'الملك السعودي' (إذا كان الخبر من السعودية)\n\n"
+        "أضف الجنسية بعد المنصب أو الوزارة مباشرة:\n"
+        "• 'رئيس الوزراء' → 'رئيس الوزراء العراقي'\n"
+        "• 'الملك' → 'الملك السعودي'\n"
+        "• 'الخارجية' → 'الخارجية السعودية' أو 'الخارجية المصرية'\n"
+        "• 'وزير السياحة' → 'وزير السياحة السعودي'\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔴 قاعدة اختصار أسماء الوزارات - مهم جداً! 🔴\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "استخدم الصيغة المختصرة للوزارات (بدون كلمة 'وزارة'):\n"
+        "• 'وزارة الخارجية العراقية' → 'الخارجية العراقية'\n"
+        "• 'وزارة الخارجية السعودية' → 'الخارجية السعودية'\n"
+        "• 'وزارة الخارجية المصرية' → 'الخارجية المصرية'\n"
+        "• 'وزارة الدفاع الباكستانية' → 'الدفاع الباكستانية'\n"
+        "• 'وزارة الداخلية الإماراتية' → 'الداخلية الإماراتية'\n"
+        "• 'وزارة الصحة السعودية' → 'الصحة السعودية'\n\n"
+        "⚠️ استثناء: 'وزارة الحج والعمرة' تبقى كما هي بدون اختصار (لأنها وحيدة في العالم)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔴 مصطلحات القضية الفلسطينية - استخدم المصطلح الصحيح! 🔴\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "استبدل المصطلحات التالية بالشكل الصحيح:\n"
+        "• 'سكان القدس' → 'المقدسيون'\n"
+        "• 'شرقي القدس' → 'القدس المحتلة'\n"
+        "• 'عرب إسرائيل' أو 'عرب اسرائيل' → 'فلسطينيو 48'\n"
+        "• 'الجدار العازل' → 'جدار الفصل العنصري'\n"
+        "• 'الأراضي المتنازع عليها' → 'الأرض الفلسطينية المحتلة'\n"
+        "• 'جيش الدفاع' أو 'جيش الدفاع الإسرائيلي' → 'جيش الاحتلال الإسرائيلي'\n"
+        "• 'شعب غزة' → 'المواطنون الفلسطينيون في قطاع غزة'\n"
+        "• 'الحكومة الإسرائيلية' → 'حكومة الاحتلال الإسرائيلي'\n\n"
         "كيف تعرف الجنسية؟\n"
-        "• واع = عراقي | واس = سعودي | وام = إماراتي\n"
-        "• بغداد = عراقي | الرياض = سعودي | القاهرة = مصري\n\n"
+        "• واع = عراقي | واس = سعودي | وام = إماراتي | وكونا = كويتي | بنا = بحريني\n"
+        "• بغداد = عراقي | الرياض = سعودي | القاهرة = مصري | الكويت = كويتي\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔴🔴🔴 الهيكل المطلوب - مهم جداً! 🔴🔴🔴\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -588,13 +1197,16 @@ def build_review_prompt(news_text: str, guidelines: Iterable[RetrievedChunk], ex
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "🔴 قاعدة الجنسية في العناوين (إلزامية!) 🔴\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "عند ذكر أي مسؤول في العنوان، يجب إضافة جنسيته:\n"
+                "عند ذكر أي مسؤول أو وزارة في العنوان، يجب إضافة الجنسية:\n"
                 "• رئيس الوزراء → رئيس الوزراء العراقي/السعودي/المصري\n"
                 "• الملك → الملك السعودي/الأردني/المغربي\n"
-                "• وزير الخارجية → وزير الخارجية المصري/الإماراتي\n\n"
+                "• الخارجية → الخارجية السعودية/المصرية/الإماراتية\n"
+                "• وزارة الصحة → وزارة الصحة السعودية\n"
+                "• وزير السياحة → وزير السياحة السعودي\n\n"
+                "⚠️ استثناء: 'وزارة الحج والعمرة' لا تحتاج جنسية (وحيدة في العالم)\n\n"
                 "كيف تحدد الجنسية:\n"
-                "• من وكالة الأنباء: واع=عراقي، واس=سعودي، وام=إماراتي\n"
-                "• من المدينة: بغداد=عراقي، الرياض=سعودي، القاهرة=مصري\n\n"
+                "• واع=عراقي | واس=سعودي | وام=إماراتي | وكونا=كويتي | بنا=بحريني\n"
+                "• بغداد=عراقي | الرياض=سعودي | القاهرة=مصري\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "🔴🔴🔴 قاعدة الاختصار - الأهم! (CRITICAL!) 🔴🔴🔴\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1031,4 +1643,222 @@ def generate_review(
     final_text = _split_into_paragraphs(final_text)
 
     return final_text
+
+
+# =============================================================================
+# DOCUMENT RETRIEVAL FUNCTIONS
+# =============================================================================
+
+def list_documents(
+    document_type: DocumentChunk.DocumentType | None = None,
+) -> dict:
+    """
+    List all uploaded documents grouped by title.
+
+    Args:
+        document_type: Optional filter by document type (guideline/example)
+
+    Returns:
+        Dictionary with document summaries
+    """
+    queryset = DocumentChunk.objects.all()
+    if document_type:
+        queryset = queryset.filter(document_type=document_type)
+
+    # Group by title and document_type
+    from django.db.models import Count, Min
+
+    documents = (
+        queryset
+        .values('title', 'source_name', 'document_type')
+        .annotate(
+            total_chunks=Count('id'),
+            created_at=Min('created_at')
+        )
+        .order_by('-created_at')
+    )
+
+    return {
+        "total_documents": len(documents),
+        "total_chunks": queryset.count(),
+        "documents": list(documents),
+    }
+
+
+def get_document_detail(
+    title: str,
+    document_type: DocumentChunk.DocumentType | None = None,
+) -> dict | None:
+    """
+    Get detailed information about a specific document including all chunks.
+
+    Args:
+        title: The document title
+        document_type: Optional filter by document type
+
+    Returns:
+        Dictionary with document details and chunks, or None if not found
+    """
+    queryset = DocumentChunk.objects.filter(title=title)
+    if document_type:
+        queryset = queryset.filter(document_type=document_type)
+
+    chunks = list(queryset.order_by('order'))
+    if not chunks:
+        return None
+
+    first_chunk = chunks[0]
+    return {
+        "title": first_chunk.title,
+        "source_name": first_chunk.source_name,
+        "document_type": first_chunk.document_type,
+        "total_chunks": len(chunks),
+        "created_at": first_chunk.created_at,
+        "chunks": [
+            {
+                "id": chunk.id,
+                "document_type": chunk.document_type,
+                "title": chunk.title,
+                "source_name": chunk.source_name,
+                "order": chunk.order,
+                "text": chunk.text,
+                "metadata": chunk.metadata,
+                "created_at": chunk.created_at,
+            }
+            for chunk in chunks
+        ],
+    }
+
+
+def delete_document(
+    title: str,
+    document_type: DocumentChunk.DocumentType | None = None,
+) -> int:
+    """
+    Delete a document and all its chunks.
+
+    Args:
+        title: The document title
+        document_type: Optional filter by document type
+
+    Returns:
+        Number of chunks deleted
+    """
+    queryset = DocumentChunk.objects.filter(title=title)
+    if document_type:
+        queryset = queryset.filter(document_type=document_type)
+
+    count = queryset.count()
+    queryset.delete()
+    return count
+
+
+def list_batches(
+    document_type: str | None = None,
+    status: str | None = None,
+) -> List[dict]:
+    """
+    List all batch uploads with optional filters.
+
+    Args:
+        document_type: Optional filter by document type
+        status: Optional filter by status
+
+    Returns:
+        List of batch records
+    """
+    queryset = FileUploadBatch.objects.all()
+    if document_type:
+        queryset = queryset.filter(document_type=document_type)
+    if status:
+        queryset = queryset.filter(status=status)
+
+    return [
+        {
+            "batch_id": str(batch.id),
+            "document_type": batch.document_type,
+            "status": batch.status,
+            "total_files": batch.total_files,
+            "processed_files": batch.processed_files,
+            "total_chunks_created": batch.total_chunks_created,
+            "error_message": batch.error_message,
+            "created_at": batch.created_at,
+            "updated_at": batch.updated_at,
+        }
+        for batch in queryset
+    ]
+
+
+def get_batch_files(batch_id: str) -> List[dict]:
+    """
+    Get all files in a batch upload.
+
+    Args:
+        batch_id: UUID of the batch
+
+    Returns:
+        List of file records
+    """
+    try:
+        batch = FileUploadBatch.objects.get(id=batch_id)
+    except FileUploadBatch.DoesNotExist:
+        raise ValueError(f"Batch {batch_id} not found")
+
+    return [
+        {
+            "id": f.id,
+            "filename": f.filename,
+            "title": f.title,
+            "file_size": f.file_size,
+            "status": f.status,
+            "chunks_created": f.chunks_created,
+            "error_message": f.error_message,
+            "created_at": f.created_at,
+        }
+        for f in batch.files.all()
+    ]
+
+
+def get_statistics() -> dict:
+    """
+    Get overall statistics about uploaded documents.
+
+    Returns:
+        Dictionary with statistics
+    """
+    total_guidelines = DocumentChunk.objects.filter(
+        document_type=DocumentChunk.DocumentType.GUIDELINE
+    ).count()
+    total_examples = DocumentChunk.objects.filter(
+        document_type=DocumentChunk.DocumentType.EXAMPLE
+    ).count()
+
+    # Count unique documents by title
+    guideline_docs = (
+        DocumentChunk.objects
+        .filter(document_type=DocumentChunk.DocumentType.GUIDELINE)
+        .values('title')
+        .distinct()
+        .count()
+    )
+    example_docs = (
+        DocumentChunk.objects
+        .filter(document_type=DocumentChunk.DocumentType.EXAMPLE)
+        .values('title')
+        .distinct()
+        .count()
+    )
+
+    return {
+        "guidelines": {
+            "total_documents": guideline_docs,
+            "total_chunks": total_guidelines,
+        },
+        "examples": {
+            "total_documents": example_docs,
+            "total_chunks": total_examples,
+        },
+        "total_documents": guideline_docs + example_docs,
+        "total_chunks": total_guidelines + total_examples,
+    }
 
