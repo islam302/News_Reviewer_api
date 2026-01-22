@@ -1,31 +1,39 @@
 from django.urls import path
 
 from .views import (
-    # Upload views
-    ExampleUploadView,
-    InstructionUploadView,
-    # Document retrieval views
-    GuidelinesListView,
-    ExamplesListView,
-    DocumentDetailView,
     # Review view
     ReviewNewsView,
+    # Instructions Dashboard views
+    InstructionListCreateView,
+    InstructionDetailView,
+    InstructionReorderView,
+    InstructionToggleActiveView,
+    # News Examples Dashboard views
+    NewsExampleListCreateView,
+    NewsExampleDetailView,
+    NewsExampleToggleActiveView,
 )
 
 app_name = "reviewer"
 
 urlpatterns = [
-    # Upload endpoints
-    path("guidelines/upload/", InstructionUploadView.as_view(), name="upload-guidelines"),
-    path("examples/upload/", ExampleUploadView.as_view(), name="upload-examples"),
+    # ==========================================================================
+    # INSTRUCTIONS DASHBOARD
+    # ==========================================================================
+    path("instructions/", InstructionListCreateView.as_view(), name="instruction-list-create"),
+    path("instructions/<uuid:pk>/", InstructionDetailView.as_view(), name="instruction-detail"),
+    path("instructions/reorder/", InstructionReorderView.as_view(), name="instruction-reorder"),
+    path("instructions/<uuid:pk>/toggle/", InstructionToggleActiveView.as_view(), name="instruction-toggle"),
 
-    # List uploaded documents
-    path("guidelines/", GuidelinesListView.as_view(), name="list-guidelines"),
-    path("examples/", ExamplesListView.as_view(), name="list-examples"),
+    # ==========================================================================
+    # NEWS EXAMPLES DASHBOARD
+    # ==========================================================================
+    path("examples/", NewsExampleListCreateView.as_view(), name="example-list-create"),
+    path("examples/<uuid:pk>/", NewsExampleDetailView.as_view(), name="example-detail"),
+    path("examples/<uuid:pk>/toggle/", NewsExampleToggleActiveView.as_view(), name="example-toggle"),
 
-    # Document detail (get/delete by title)
-    path("documents/<str:title>/", DocumentDetailView.as_view(), name="document-detail"),
-
-    # Review endpoint
+    # ==========================================================================
+    # REVIEW ENDPOINT (Uses user's instructions and examples)
+    # ==========================================================================
     path("review/", ReviewNewsView.as_view(), name="review-news"),
 ]

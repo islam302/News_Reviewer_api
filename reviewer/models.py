@@ -1,74 +1,65 @@
 import uuid
 from django.db import models
+from django.conf import settings
 
 
-class FileUploadBatch(models.Model):
-    """Tracks batch uploads of multiple files."""
+class Instruction(models.Model):
+    """
+    User-specific instructions for news review.
+    Each user can have multiple instructions that will be applied when reviewing news.
 
-    class Status(models.TextChoices):
-        PENDING = 'pending', 'Pending'
-        PROCESSING = 'processing', 'Processing'
-        COMPLETED = 'completed', 'Completed'
-        FAILED = 'failed', 'Failed'
-
+    - content: Original instruction text (Arabic) - shown to user
+    - processed_content: Processed/translated instruction (English) - used by AI model
+    """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    document_type = models.CharField(max_length=16)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
-    total_files = models.PositiveIntegerField(default=0)
-    processed_files = models.PositiveIntegerField(default=0)
-    total_chunks_created = models.PositiveIntegerField(default=0)
-    error_message = models.TextField(blank=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='instructions'
+    )
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    content = models.TextField(help_text="التعليمات الأصلية بالعربي")
+    processed_content = models.TextField(
+        blank=True,
+        help_text="التعليمات المعالجة والمترجمة للإنجليزية - تُستخدم بواسطة الموديل"
+    )
+    is_active = models.BooleanField(default=True)
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['order', 'created_at']
+        unique_together = ['user', 'title']
+
+    def __str__(self):
+        return f"{self.title} - {self.user.username}"
+
+
+class NewsExample(models.Model):
+    """
+    User-specific examples of processed news.
+    These examples help the AI understand how to apply the instructions.
+    Each example contains the original news text and the expected output after processing.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='news_examples'
+    )
+    title = models.CharField(max_length=255)
+    original_text = models.TextField(help_text="النص الأصلي للخبر قبل المعالجة")
+    processed_text = models.TextField(help_text="النص بعد المعالجة (المخرج المتوقع)")
+    notes = models.TextField(blank=True, help_text="ملاحظات إضافية حول هذا المثال")
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['-created_at']
+        unique_together = ['user', 'title']
 
     def __str__(self):
-        return f"Batch {self.id} - {self.document_type} ({self.status})"
-
-
-class UploadedFile(models.Model):
-    """Tracks individual files within a batch upload."""
-
-    class Status(models.TextChoices):
-        PENDING = 'pending', 'Pending'
-        PROCESSING = 'processing', 'Processing'
-        COMPLETED = 'completed', 'Completed'
-        FAILED = 'failed', 'Failed'
-
-    batch = models.ForeignKey(FileUploadBatch, on_delete=models.CASCADE, related_name='files')
-    filename = models.CharField(max_length=255)
-    title = models.CharField(max_length=255, blank=True)
-    file_size = models.PositiveIntegerField(default=0)  # Size in bytes
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
-    chunks_created = models.PositiveIntegerField(default=0)
-    error_message = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['created_at']
-
-    def __str__(self):
-        return f"{self.filename} ({self.status})"
-
-
-class DocumentChunk(models.Model):
-    class DocumentType(models.TextChoices):
-        GUIDELINE = 'guideline', 'Guideline'
-        EXAMPLE = 'example', 'Example'
-
-    document_type = models.CharField(max_length=16, choices=DocumentType.choices)
-    title = models.CharField(max_length=255)
-    source_name = models.CharField(max_length=255, blank=True)
-    order = models.PositiveIntegerField(default=0)
-    text = models.TextField()
-    embedding = models.JSONField()
-    metadata = models.JSONField(default=dict, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['document_type', 'title', 'order', 'id']
-
-    def __str__(self):
-        return f"{self.document_type}:{self.title}#{self.order}"
+        return f"{self.title} - {self.user.username}"
