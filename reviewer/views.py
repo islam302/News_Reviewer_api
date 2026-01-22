@@ -25,7 +25,7 @@ from .services import generate_review
 
 class ReviewNewsView(APIView):
     """Review news using user's instructions and examples."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = []
 
     def post(self, request, *args, **kwargs):
         serializer = ReviewRequestSerializer(data=request.data)
